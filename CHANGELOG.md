@@ -3,6 +3,42 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] — 2026-09-22
+
+Second live acceptance pass, this time with the live suite runnable from a
+shell (see Tests in the README).
+
+### Fixed
+
+- **Removing contacts from iCloud / CardDAV groups now works.** On current
+  macOS `CNSaveRequest.removeMember:fromGroup:` reports success and changes
+  nothing for CardDAV groups, whatever record it is given — raw or unified
+  member, mutable or immutable group, fresh store, after a delay. Contacts.app
+  scripting removes them instantly, so the connector verifies the framework
+  result and falls back to Contacts.app when the membership did not change.
+  If neither route changes it, the tool now fails instead of reporting success.
+- **Notes stalled after writes.** The earlier timeouts were not a missing
+  Automation grant: Contacts.app holds Apple Events for 10–30 s while it syncs
+  changes just made through the framework (an iCloud round trip). The
+  scripting timeout is now 40 s, the fail-fast backoff after a timeout is
+  30 s, and the message says to retry shortly before pointing at the
+  Automation pane. Verified: notes read and write within seconds of a burst
+  of iCloud writes.
+- `find_duplicate_contacts` documentation now says that small clusters can be
+  cut off by `limit` in a store with many real duplicates; the live test asks
+  for everything.
+- Contacts.app scripting no longer inherits the server's stdin.
+
+### Changed
+
+- Contacts.app scripting lives in `appscript.py` (notes and group removal);
+  `notes.py` re-exports the notes names.
+
+### Known limitations (observed, not fixed)
+
+- Photos freshly set on iCloud contacts are still not read back through the
+  framework's unified view; Contacts.app shows them. Unchanged from 0.1.1.
+
 ## [0.1.1] — 2026-09-22
 
 Fixes from the first live acceptance run against a real store (iCloud,

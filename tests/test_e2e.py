@@ -296,20 +296,21 @@ def t_image_bytes():
     eq(c._image_bytes(b), b"")
 
 
-@test("A", "notes backoff fails fast after a timeout")
+@test("A", "scripting backoff fails fast after a timeout")
 def t_notes_backoff():
     import time
-    from apple_contacts_mcp import notes
-    saved = notes._blocked_until
+    from apple_contacts_mcp import appscript, notes
+    saved = appscript._blocked_until
     try:
-        notes._blocked_until = time.monotonic() + 60
+        appscript._blocked_until = time.monotonic() + 60
         raises(notes.NotesUnavailable, lambda: notes.read_note("x:ABPerson"))
+        raises(appscript.ScriptingUnavailable, lambda: appscript.remove_from_group("g:ABGroup", ["x:ABPerson"]))
         try:
             notes.read_note("x:ABPerson")
         except notes.NotesUnavailable as exc:
-            truthy("Automation" in str(exc) and "Not retried" in str(exc), str(exc))
+            truthy("Automation" in str(exc) and "Not retried" in str(exc) and "busy" in str(exc), str(exc))
     finally:
-        notes._blocked_until = saved
+        appscript._blocked_until = saved
 
 
 @test("A", "version agrees across pyproject, manifest, and __init__")
@@ -325,10 +326,12 @@ def t_versions():
 @test("A", "notes script passes arguments via argv, never interpolation")
 def t_notes_script():
     from apple_contacts_mcp import notes
-    truthy("argv" in notes._JXA)
-    # A note full of quotes and backslashes must not appear in the script text.
-    truthy("${" not in notes._JXA, "no template interpolation")
-    eq(notes._JXA.count('Application("Contacts")'), 1)
+    from apple_contacts_mcp import appscript
+    for script in (appscript._JXA_NOTE, appscript._JXA_GROUP_REMOVE):
+        truthy("argv" in script)
+        truthy("${" not in script, "no template interpolation")
+        eq(script.count('Application("Contacts")'), 1)
+    eq(notes._JXA, appscript._JXA_NOTE)
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +638,9 @@ def t_live_dupes_merge():
                                        LabeledValue(label="work", value="GRACE@example.com")],
               scalars={"job_title": "Rear Admiral"}, birthday=PartialDate(year=1906, month=12, day=9),
               group_ids=[_test_group_id] if _test_group_id else None)
-    clusters = store.find_duplicates()
+    # Largest clusters first, so a two-member test pair is cut off by the
+    # default limit in any store with real duplicates. Ask for everything.
+    clusters = store.find_duplicates(limit=100000)
     ours = [cl for cl in clusters if {c.id for c in cl.contacts} >= {a.id, b.id}]
     reasons = {cl.reason for cl in ours}
     is_in("same_name", reasons, "name cluster")

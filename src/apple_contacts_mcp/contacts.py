@@ -73,7 +73,7 @@ from .models import (
     SocialProfile,
     VCardExport,
 )
-from . import notes as _notes
+from . import appscript as _notes
 from .permissions import (
     CN_ENTITY_CONTACTS,
     GRANTED_STATUSES,
@@ -856,10 +856,35 @@ class ContactsStore:
         raw_by_id = self._raw_group_members(group_id)
         targets = {str(raw_by_id[i].identifier()): raw_by_id[i] for i in contact_ids if i in raw_by_id}
         if targets:
+            before = set(self._group_member_ids(group_id))
             req = CNSaveRequest.alloc().init()
             for c in targets.values():
                 req.removeMember_fromGroup_(c, g)
             self._save(req, "remove contacts from group")
+            still = before & set(self._group_member_ids(group_id)) & set(
+                i for i in contact_ids if i in raw_by_id
+            )
+            if still:
+                # The framework reports success but leaves CardDAV (iCloud,
+                # Google, …) memberships untouched — every record variant was
+                # tried. Contacts.app's own scripting does remove them, so
+                # fall back to it rather than claim a change that did not
+                # happen. Needs Automation permission; see appscript.py.
+                logger.info("Framework removal left %d membership(s); using Contacts.app", len(still))
+                try:
+                    _notes.remove_from_group(group_id, sorted(still))
+                except _notes.ScriptingUnavailable as exc:
+                    raise RuntimeError(
+                        "The Contacts framework accepted the removal but the group "
+                        "membership did not change (this happens with iCloud and other "
+                        f"CardDAV groups), and the Contacts.app fallback failed: {exc}"
+                    ) from exc
+                remaining = still & set(self._group_member_ids(group_id))
+                if remaining:
+                    raise RuntimeError(
+                        "Could not remove from group: membership unchanged after both the "
+                        f"framework and Contacts.app were asked ({', '.join(sorted(remaining))})."
+                    )
         model = self._group_to_model(self._get_group(group_id), self._container_name_map(), True)
         return GroupResult(group=model, success=True, member_count=model.member_count)
 

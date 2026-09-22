@@ -67,7 +67,8 @@ Contacts.app's **scripting dictionary**, however, exposes `note` on `person` wit
 What that means in practice:
 
 - Notes are **only touched when explicitly requested**: `get_contact(include_notes=true)`, `get_me_card(include_notes=true)`, `set_contact_notes`, or a `notes` argument on `create_contact` / `update_contact`. Listing and searching never read notes.
-- The first such call should prompt for **Automation** permission, separate from the Contacts permission. If Contacts.app does not answer within 20 s the connector assumes the prompt was never approved, reports that with the exact System Settings path (Privacy & Security → Automation → Claude → Contacts), and fails fast for the next two minutes rather than stalling every caller. Grant it there if no prompt appeared.
+- The first such call should prompt for **Automation** permission, separate from the Contacts permission. Claude Desktop launches extension servers through a helper that makes `uv` itself the responsible process, so the entry may appear under **uv** rather than **Claude** in System Settings → Privacy & Security → Automation.
+- Contacts.app answers in well under a second when idle, but for 10–30 s after changes made through the framework (an iCloud round trip after a create or update) it holds Apple Events while it syncs. The connector waits up to 40 s; on a timeout it fails fast for 30 s with a message that says to retry shortly, and names the Automation pane in case it never answers.
 - It may launch Contacts.app in the background, and it is slow compared with the framework (hundreds of ms per call).
 - In results, `notes` is `null` when not requested **or** when unreadable — never an empty string standing in for "unknown". When unreadable, `notes_unavailable_reason` says why.
 - `merge_contacts` deletes contacts, and a deleted contact's note is gone. So it reads notes first, appends any distinct ones to the survivor, and **refuses** if a note could not be read. `ignore_notes=true` overrides that.
@@ -80,7 +81,8 @@ If the framework ever does hand over notes (for example, a future signed build w
 
 - **iCloud photos set through the connector are not read back.** After iCloud syncs the change, Contacts.app's own record carries the photo and displays it, but the Contacts framework's unified view reports the contact as having no image, so `get_contact_image` fails. Photos that have been on iCloud contacts for a while read fine, and On My Mac contacts work end to end. Under investigation; see the changelog.
 - **iCloud normalises some fields on sync.** A social profile's label is dropped and IM service names are rewritten (Jabber becomes `JabberInstant`). The create/update response shows what was written; a later read shows what iCloud kept.
-- Group membership changes need the raw member record inside the group's container; the connector resolves that for you, which costs one extra lookup per member on removal.
+- **Removing contacts from iCloud / CardDAV groups goes through Contacts.app.** On current macOS the framework's `removeMember` reports success and changes nothing for CardDAV groups. The connector detects that and asks Contacts.app to do it, so removal needs the same Automation permission as notes on those accounts. Local (On My Mac) groups are handled by the framework alone. If neither route changes the membership, the tool fails rather than reporting success.
+- `find_duplicate_contacts` returns the largest clusters first, so in a store with many real duplicates a two-contact pair can fall outside the default `limit` of 50. Raise `limit` or scope with `container_id`.
 - Linked-card management (link / unlink unified contacts) and non-Gregorian birthdays have no public API and are not exposed.
 
 ---
@@ -198,8 +200,12 @@ claude-connector-apple-contacts/
 # manifest ↔ server tool-list check. No permissions needed.
 uv run python tests/test_e2e.py --skip-live
 
-# Full suite (requires Contacts permission for the running process)
-uv run python tests/test_e2e.py
+# Full suite. A plain shell is denied Contacts access on macOS (the request
+# returns "Access Denied" without a prompt), so run it the way Claude Desktop
+# runs the server: through its disclaimer helper, which makes `uv` the
+# process macOS holds responsible — the same `uv` you granted Contacts to.
+/Applications/Claude.app/Contents/Helpers/disclaimer --pgroup -- \
+  ~/.local/bin/uv run --project "$PWD" python tests/test_e2e.py
 ```
 
 Two groups:
@@ -207,10 +213,11 @@ Two groups:
 - **A — static.** Always runs.
 - **B — live.** Operates against a dedicated `__claude_mcp_test__` group and
   contacts with the family name `__ClaudeMCPTest__`, created at setup and
-  removed at the end (including leftovers from an interrupted run). Needs
-  Contacts permission for the process running the tests. Notes are
-  deliberately not exercised — they would trigger an Automation prompt
-  and launch Contacts.app.
+  removed at the end (including leftovers from an interrupted run — so do
+  not run it while other test records you care about exist). Needs
+  Contacts permission for the responsible process, which the disclaimer
+  invocation above provides. Notes are deliberately not exercised — they
+  would trigger an Automation prompt and launch Contacts.app.
 
 ---
 
