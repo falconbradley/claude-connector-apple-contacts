@@ -220,6 +220,27 @@ def _build_label_tables() -> tuple[dict[str, str], dict[str, str]]:
 _LABEL_TO_CONST, _CONST_TO_LABEL = _build_label_tables()
 
 
+def _service_table(prefix: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for name in dir(CN):
+        if name.startswith(prefix) and not name.endswith("Key"):
+            const = getattr(CN, name, None)
+            if isinstance(const, str):
+                out[const.lower().replace(" ", "")] = const
+                out[name[len(prefix):].lower()] = const
+    return out
+
+
+_IM_SERVICES = _service_table("CNInstantMessageService")
+_SOCIAL_SERVICES = _service_table("CNSocialProfileService")
+
+
+def _service_in(service: str, table: dict[str, str]) -> str:
+    """Friendly service name ("jabber", "twitter") → Apple's constant; custom passes through."""
+    s = (service or "").strip()
+    return table.get(s.lower().replace(" ", ""), s)
+
+
 def _label_in(label: Optional[str]) -> Optional[str]:
     """Friendly label from the caller → Apple constant (or custom pass-through)."""
     if label is None:
@@ -303,6 +324,16 @@ def _bytes_of(nsdata: Any) -> bytes:
 
 def _nsdata_of(b: bytes) -> Any:
     return NSData.dataWithBytes_length_(b, len(b))
+
+
+def _image_bytes(c: Any) -> bytes:
+    """Full image bytes of a contact fetched with the image keys, or b""."""
+    try:
+        if not c.isKeyAvailable_(CN.CNContactImageDataAvailableKey) or not c.imageDataAvailable():
+            return b""
+        return _bytes_of(c.imageData()) if c.isKeyAvailable_(CN.CNContactImageDataKey) else b""
+    except Exception:
+        return b""
 
 
 def _sniff_mime(b: bytes) -> str:
@@ -784,14 +815,49 @@ class ContactsStore:
         model = self._group_to_model(self._get_group(group_id), self._container_name_map(), True)
         return GroupResult(group=model, success=True, member_count=model.member_count)
 
+    def _raw_group_members(self, group_id: str) -> dict[str, Any]:
+        """unified contact id → the raw (non-unified) member record in the group.
+
+        CNSaveRequest.removeMember:fromGroup: operates on the record that
+        actually holds the membership, inside the group's container. Passing
+        the unified contact instead either fails with a Core Data error
+        (local groups) or is silently ignored (CardDAV groups). A unified
+        contact's identifier is one of its linked records' identifiers, so
+        map each raw member back through its unified counterpart.
+        """
+        pred = CNContact.predicateForContactsInGroupWithIdentifier_(group_id)
+        req = CNContactFetchRequest.alloc().initWithKeysToFetch_([CN.CNContactIdentifierKey])
+        req.setPredicate_(pred)
+        req.setUnifyResults_(False)
+        raw: list[Any] = []
+
+        def block(contact: Any, stop: Any) -> None:
+            raw.append(contact)
+
+        try:
+            ok, err = self._store.enumerateContactsWithFetchRequest_error_usingBlock_(req, None, block)
+        except objc.error as exc:
+            raise RuntimeError(f"Contacts fetch failed: {exc}") from exc
+        if not ok:
+            raise RuntimeError(f"Contacts fetch failed: {_nserror_str(err)}")
+        out: dict[str, Any] = {}
+        for r in raw:
+            rid = str(r.identifier())
+            out.setdefault(rid, r)
+            u, _ = self._store.unifiedContactWithIdentifier_keysToFetch_error_(
+                rid, [CN.CNContactIdentifierKey], None
+            )
+            if u is not None:
+                out.setdefault(str(u.identifier()), r)
+        return out
+
     def remove_from_group(self, group_id: str, contact_ids: list[str]) -> GroupResult:
         g = self._get_group(group_id)
-        members = set(self._group_member_ids(group_id))
-        targets = [i for i in contact_ids if i in members]
+        raw_by_id = self._raw_group_members(group_id)
+        targets = {str(raw_by_id[i].identifier()): raw_by_id[i] for i in contact_ids if i in raw_by_id}
         if targets:
-            contacts = self._fetch_by_ids(targets, [CN.CNContactIdentifierKey])
             req = CNSaveRequest.alloc().init()
-            for c in contacts:
+            for c in targets.values():
                 req.removeMember_fromGroup_(c, g)
             self._save(req, "remove contacts from group")
         model = self._group_to_model(self._get_group(group_id), self._container_name_map(), True)
@@ -929,12 +995,24 @@ class ContactsStore:
 
     def get_contact_image(self, contact_id: str, thumbnail: bool = False) -> Optional[ContactImage]:
         c = self._fetch_one(contact_id, _IMAGE_KEYS)
-        if not c.imageDataAvailable():
-            return None
-        data = _bytes_of(c.thumbnailImageData() if thumbnail else c.imageData())
-        if not data and thumbnail:
-            data = _bytes_of(c.imageData())
+        data = b""
+        if c.imageDataAvailable():
+            data = _bytes_of(c.thumbnailImageData() if thumbnail else c.imageData())
+            if not data and thumbnail:
+                data = _bytes_of(c.imageData())
         if not data:
+            # Distinguish "no photo" from "a photo the framework cannot load".
+            # Seen with photos freshly set on iCloud contacts: after the
+            # CardDAV round trip Contacts.app shows the photo, but the unified
+            # contact fetched with the image-data keys reports none, while a
+            # fetch of the availability flag alone may still say yes.
+            probe = self._fetch_one(contact_id, [CN.CNContactImageDataAvailableKey])
+            if probe.imageDataAvailable():
+                raise RuntimeError(
+                    f"Contact {contact_id} reports a photo, but the Contacts framework "
+                    "could not load its data. This happens with photos recently set on "
+                    "iCloud contacts; Contacts.app shows the photo. Try again later."
+                )
             return None
         return ContactImage(
             contact_id=contact_id,
@@ -1093,14 +1171,17 @@ class ContactsStore:
             vals = []
             for sp in social_profiles:
                 prof = CNSocialProfile.alloc().initWithUrlString_username_userIdentifier_service_(
-                    sp.url or None, sp.username or "", sp.user_identifier or None, sp.service or ""
+                    sp.url or None, sp.username or "", sp.user_identifier or None,
+                    _service_in(sp.service, _SOCIAL_SERVICES),
                 )
                 vals.append(CNLabeledValue.labeledValueWithLabel_value_(_label_in(sp.label), prof))
             mc.setSocialProfiles_(vals)
         if instant_messages is not None:
             vals = []
             for im in instant_messages:
-                addr = CNInstantMessageAddress.alloc().initWithUsername_service_(im.username, im.service)
+                addr = CNInstantMessageAddress.alloc().initWithUsername_service_(
+                    im.username, _service_in(im.service, _IM_SERVICES)
+                )
                 vals.append(CNLabeledValue.labeledValueWithLabel_value_(_label_in(im.label), addr))
             mc.setInstantMessageAddresses_(vals)
         if relations is not None:
@@ -1255,7 +1336,7 @@ class ContactsStore:
     def export_vcards(self, contact_ids: list[str], include_images: bool = False) -> VCardExport:
         keys = [CNContactVCardSerialization.descriptorForRequiredKeys()]
         if include_images:
-            keys.append(CN.CNContactImageDataKey)
+            keys += [CN.CNContactImageDataAvailableKey, CN.CNContactImageDataKey]
         contacts = self._fetch_by_ids(contact_ids, keys)
         found = {str(c.identifier()) for c in contacts}
         missing = [i for i in contact_ids if i not in found]
@@ -1266,8 +1347,7 @@ class ContactsStore:
             raise RuntimeError(f"vCard export failed: {_nserror_str(err)}")
         text = _bytes_of(data).decode("utf-8", "replace")
         if include_images:
-            text = _inject_vcard_photos(text, [_bytes_of(c.imageData()) if c.imageDataAvailable() else b""
-                                               for c in contacts])
+            text = _inject_vcard_photos(text, [_image_bytes(c) for c in contacts])
         return VCardExport(contact_count=len(contacts), vcard=text)
 
     def import_vcards(self, vcard: str, container_id: Optional[str] = None) -> ImportResult:
@@ -1304,13 +1384,15 @@ class ContactsStore:
         pred = self._scope_predicate(container_id, None)
         rows = self._fetch(_SUMMARY_KEYS, pred)
         clusters: list[DuplicateCluster] = []
-        seen_pairs: set[frozenset[str]] = set()
+        # De-duplicate per reason only: the same pair matching on name AND
+        # email is two findings, and callers (and the tests) expect both.
+        seen: dict[str, set[frozenset[str]]] = {}
 
         def emit(reason: str, key: str, members: list[Any]) -> None:
             ids = frozenset(str(c.identifier()) for c in members)
-            if len(ids) < 2 or ids in seen_pairs:
+            if len(ids) < 2 or ids in seen.setdefault(reason, set()):
                 return
-            seen_pairs.add(ids)
+            seen[reason].add(ids)
             clusters.append(DuplicateCluster(
                 reason=reason, key=key,  # type: ignore[arg-type]
                 contacts=[_contact_to_summary(c) for c in members],

@@ -3,6 +3,48 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] — 2026-09-22
+
+Fixes from the first live acceptance run against a real store (iCloud,
+Google, USC CardDAV accounts plus On My Mac).
+
+### Fixed
+
+- **`remove_contacts_from_group` did nothing** on CardDAV groups and failed
+  with a Core Data error (134092) on local groups. `CNSaveRequest.removeMember`
+  needs the raw member record inside the group's container, not the unified
+  contact; the connector now resolves unified ids to raw members first.
+- **`export_vcards(include_images=true)` crashed** with
+  `CNPropertyNotFetchedException`: the image-availability key was not fetched
+  alongside the image data.
+- **`find_duplicate_contacts` reported each pair once**, under the first
+  reason that matched, so a pair sharing both a name and an email never
+  appeared as `shared_email`. De-duplication is now per reason.
+- **Errors reached the client as a bare `Error executing tool <name>`.** All
+  deliberate failures (bad input, record not found, framework refusal,
+  permission denied) are now raised as `ToolError`, so the message —
+  e.g. `Contact not found: …` — is what the caller sees.
+- **Notes stalled every caller for 30 s** when Contacts.app scripting had no
+  Automation grant; a merge that read several notes overran the client's
+  tool timeout. The timeout is now 20 s, a timed-out call blocks further
+  attempts for two minutes with an immediate, explicit reason, and the
+  message names the System Settings pane to fix it.
+- Instant-message and social-profile service names are mapped to Apple's
+  constants on write (`jabber` → `Jabber`, `twitter` → `Twitter`), so a
+  synced account normalises them predictably.
+
+### Known limitations (observed, not fixed)
+
+- **iCloud photos set through the framework are not read back.** After the
+  CardDAV round trip, Contacts.app's own record carries the JPEG and shows
+  it, but `CNContact.imageDataAvailable` on the unified contact reports
+  false, so `get_contact_image` says the contact has no photo. Long-standing
+  iCloud photos read fine. On My Mac photos work end to end. Under
+  investigation.
+- iCloud normalises some fields on sync: a social profile's label is dropped
+  and IM services are rewritten (Jabber becomes `JabberInstant`). The create
+  response shows what was sent; a later read shows what iCloud kept.
+
 ## [0.1.0] — 2026-09-22
 
 Initial release.

@@ -58,6 +58,7 @@ import sys
 from typing import Literal, Optional
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__
 from .models import (
@@ -148,6 +149,29 @@ def _require_store():
         raise RuntimeError(f"Could not initialise the Contacts store: {exc}") from exc
 
 
+def tool(fn):
+    """Register `fn` as an MCP tool and keep its failure messages.
+
+    The SDK reports any exception other than ToolError to the client as a
+    bare "Error executing tool <name>", logging the real message server-side
+    only. Every failure this server raises deliberately — bad input, a
+    missing record, a framework refusal, a permission problem — is written
+    to be read by the caller, so re-raise those as ToolError.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ToolError:
+            raise
+        except (ValueError, RuntimeError, PermissionDeniedError) as exc:
+            raise ToolError(str(exc)) from exc
+
+    return mcp.tool()(wrapper)
+
+
 def _clamp_limit(limit: int) -> int:
     return max(1, min(int(limit), 500))
 
@@ -160,7 +184,7 @@ DuplicateBy = Literal["name", "email", "phone"]
 # Tools — containers & groups
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@tool
 def list_containers() -> list[Container]:
     """List every contacts account (container) on this Mac.
 
@@ -171,7 +195,7 @@ def list_containers() -> list[Container]:
     return _require_store().list_containers()
 
 
-@mcp.tool()
+@tool
 def list_groups(container_id: Optional[str] = None, with_counts: bool = True) -> list[Group]:
     """List contact groups, optionally within one container.
 
@@ -182,7 +206,7 @@ def list_groups(container_id: Optional[str] = None, with_counts: bool = True) ->
     return _require_store().list_groups(container_id=container_id, with_counts=with_counts)
 
 
-@mcp.tool()
+@tool
 def create_group(name: str, container_id: Optional[str] = None) -> GroupResult:
     """Create a new contact group.
 
@@ -193,7 +217,7 @@ def create_group(name: str, container_id: Optional[str] = None) -> GroupResult:
     return _require_store().create_group(name=name, container_id=container_id)
 
 
-@mcp.tool()
+@tool
 def update_group(group_id: str, name: str) -> GroupResult:
     """Rename a contact group.
 
@@ -204,7 +228,7 @@ def update_group(group_id: str, name: str) -> GroupResult:
     return _require_store().update_group(group_id=group_id, name=name)
 
 
-@mcp.tool()
+@tool
 def delete_group(group_id: str) -> GroupResult:
     """Delete a contact group. The contacts in it are NOT deleted.
 
@@ -217,7 +241,7 @@ def delete_group(group_id: str) -> GroupResult:
     return _require_store().delete_group(group_id)
 
 
-@mcp.tool()
+@tool
 def add_contacts_to_group(group_id: str, contact_ids: list[str]) -> GroupResult:
     """Add contacts to a group. Contacts already in the group are skipped, so
     calling this twice is safe.
@@ -231,7 +255,7 @@ def add_contacts_to_group(group_id: str, contact_ids: list[str]) -> GroupResult:
     return _require_store().add_to_group(group_id, contact_ids)
 
 
-@mcp.tool()
+@tool
 def remove_contacts_from_group(group_id: str, contact_ids: list[str]) -> GroupResult:
     """Remove contacts from a group. Ids not in the group are ignored.
 
@@ -248,7 +272,7 @@ def remove_contacts_from_group(group_id: str, contact_ids: list[str]) -> GroupRe
 # Tools — contacts (read)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@tool
 def get_stats() -> ContactsStats:
     """Return aggregate counts: containers, groups, contacts, people vs
     organisations, how many have an email / phone / photo, and birthdays in
@@ -256,7 +280,7 @@ def get_stats() -> ContactsStats:
     return _require_store().get_stats()
 
 
-@mcp.tool()
+@tool
 def list_contacts(
     container_id: Optional[str] = None,
     group_id: Optional[str] = None,
@@ -294,7 +318,7 @@ def list_contacts(
     return SearchResult(total=total, offset=offset, limit=limit, contacts=rows)
 
 
-@mcp.tool()
+@tool
 def search_contacts(
     query: str,
     container_id: Optional[str] = None,
@@ -328,7 +352,7 @@ def search_contacts(
     return SearchResult(total=total, offset=offset, limit=limit, contacts=rows)
 
 
-@mcp.tool()
+@tool
 def get_contact(contact_id: str, include_notes: bool = False) -> ContactDetail:
     """Fetch one contact with every property.
 
@@ -350,7 +374,7 @@ def get_contact(contact_id: str, include_notes: bool = False) -> ContactDetail:
     return _require_store().get_contact(contact_id, include_notes=include_notes)
 
 
-@mcp.tool()
+@tool
 def get_contact_link(contact_id: str) -> dict:
     """Return an addressbook:// URL that opens the contact in Contacts.app.
 
@@ -361,7 +385,7 @@ def get_contact_link(contact_id: str) -> dict:
     return {"contact_id": contact_id, "contact_link": link}
 
 
-@mcp.tool()
+@tool
 def get_me_card(include_notes: bool = False) -> ContactDetail:
     """Return the user's own contact card (the one marked "me" in Contacts.app).
 
@@ -376,7 +400,7 @@ def get_me_card(include_notes: bool = False) -> ContactDetail:
     return me
 
 
-@mcp.tool()
+@tool
 def get_contact_image(contact_id: str, thumbnail: bool = False) -> ContactImage:
     """Return the contact's photo as base64, with its MIME type.
 
@@ -390,7 +414,7 @@ def get_contact_image(contact_id: str, thumbnail: bool = False) -> ContactImage:
     return img
 
 
-@mcp.tool()
+@tool
 def export_vcards(contact_ids: list[str], include_images: bool = False) -> VCardExport:
     """Export one or more contacts as vCard 3.0 text.
 
@@ -403,7 +427,7 @@ def export_vcards(contact_ids: list[str], include_images: bool = False) -> VCard
     return _require_store().export_vcards(contact_ids, include_images=include_images)
 
 
-@mcp.tool()
+@tool
 def find_duplicate_contacts(
     by: Optional[list[DuplicateBy]] = None,
     container_id: Optional[str] = None,
@@ -433,7 +457,7 @@ def find_duplicate_contacts(
 # Tools — contacts (write)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@tool
 def create_contact(
     given_name: Optional[str] = None,
     family_name: Optional[str] = None,
@@ -510,7 +534,7 @@ def create_contact(
     return ContactResult(contact=detail, success=True)
 
 
-@mcp.tool()
+@tool
 def update_contact(
     contact_id: str,
     given_name: Optional[str] = None,
@@ -571,7 +595,7 @@ def update_contact(
     return ContactResult(contact=detail, success=True)
 
 
-@mcp.tool()
+@tool
 def delete_contact(contact_id: str) -> DeleteResult:
     """Delete a contact. DESTRUCTIVE and not undoable from here.
 
@@ -581,7 +605,7 @@ def delete_contact(contact_id: str) -> DeleteResult:
     return _require_store().delete_contact(contact_id)
 
 
-@mcp.tool()
+@tool
 def set_contact_image(
     contact_id: str,
     image_base64: Optional[str] = None,
@@ -605,7 +629,7 @@ def set_contact_image(
     return ContactResult(contact=detail, success=True)
 
 
-@mcp.tool()
+@tool
 def set_contact_notes(contact_id: str, notes: Optional[str] = None) -> ContactResult:
     """Set (or clear, with null / "") the free-text note on a contact.
 
@@ -622,7 +646,7 @@ def set_contact_notes(contact_id: str, notes: Optional[str] = None) -> ContactRe
     return ContactResult(contact=detail, success=True)
 
 
-@mcp.tool()
+@tool
 def import_vcards(vcard: str, container_id: Optional[str] = None) -> ImportResult:
     """Create contacts from vCard text (one or many records).
 
@@ -633,7 +657,7 @@ def import_vcards(vcard: str, container_id: Optional[str] = None) -> ImportResul
     return _require_store().import_vcards(vcard, container_id=container_id)
 
 
-@mcp.tool()
+@tool
 def merge_contacts(
     primary_id: str,
     other_ids: list[str],

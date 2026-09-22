@@ -250,16 +250,66 @@ def t_manifest_tools():
         truthy(t.description and t.description.strip(), f"{t.name} has no description")
 
 
-@test("A", "server input validation")
+@test("A", "server input validation surfaces as ToolError with the message intact")
 def t_server_validation():
+    from mcp.server.mcpserver.exceptions import ToolError
     from apple_contacts_mcp import server
-    # These fail before touching the store, so no permission is needed.
-    raises(ValueError, lambda: server.search_contacts(query="   "))
-    raises(ValueError, lambda: server.create_contact())
-    raises(ValueError, lambda: server.add_contacts_to_group(group_id="g", contact_ids=[]))
-    raises(ValueError, lambda: server.remove_contacts_from_group(group_id="g", contact_ids=[]))
-    raises(ValueError, lambda: server.export_vcards(contact_ids=[]))
-    raises(ValueError, lambda: server.merge_contacts(primary_id="a", other_ids=[]))
+    # These fail before touching the store, so no permission is needed. They
+    # must arrive as ToolError: anything else reaches the client as a bare
+    # "Error executing tool <name>" with the reason dropped.
+    for fn in (
+        lambda: server.search_contacts(query="   "),
+        lambda: server.create_contact(),
+        lambda: server.add_contacts_to_group(group_id="g", contact_ids=[]),
+        lambda: server.remove_contacts_from_group(group_id="g", contact_ids=[]),
+        lambda: server.export_vcards(contact_ids=[]),
+        lambda: server.merge_contacts(primary_id="a", other_ids=[]),
+    ):
+        try:
+            fn()
+        except ToolError as exc:
+            truthy(str(exc).strip(), "ToolError carries a message")
+            truthy("Error executing tool" not in str(exc), "message is the reason, not the SDK wrapper")
+        else:
+            raise AssertionError("expected ToolError")
+
+
+@test("A", "service names map to Apple constants; custom services pass through")
+def t_services():
+    from apple_contacts_mcp import contacts as c
+    eq(c._service_in("jabber", c._IM_SERVICES), "Jabber")
+    eq(c._service_in("Google Talk", c._IM_SERVICES), "GoogleTalk")
+    eq(c._service_in("twitter", c._SOCIAL_SERVICES), "Twitter")
+    eq(c._service_in("linkedin", c._SOCIAL_SERVICES), "LinkedIn")
+    eq(c._service_in("game center", c._SOCIAL_SERVICES), "Game Center")
+    eq(c._service_in("Mastodon", c._SOCIAL_SERVICES), "Mastodon")
+
+
+@test("A", "image bytes helper tolerates unfetched keys")
+def t_image_bytes():
+    from apple_contacts_mcp import contacts as c
+    from Contacts import CNMutableContact
+    png = (ROOT / "icons" / "icon-128.png").read_bytes()
+    a = CNMutableContact.alloc().init(); a.setImageData_(c._nsdata_of(png))
+    eq(c._image_bytes(a), png)
+    b = CNMutableContact.alloc().init()
+    eq(c._image_bytes(b), b"")
+
+
+@test("A", "notes backoff fails fast after a timeout")
+def t_notes_backoff():
+    import time
+    from apple_contacts_mcp import notes
+    saved = notes._blocked_until
+    try:
+        notes._blocked_until = time.monotonic() + 60
+        raises(notes.NotesUnavailable, lambda: notes.read_note("x:ABPerson"))
+        try:
+            notes.read_note("x:ABPerson")
+        except notes.NotesUnavailable as exc:
+            truthy("Automation" in str(exc) and "Not retried" in str(exc), str(exc))
+    finally:
+        notes._blocked_until = saved
 
 
 @test("A", "version agrees across pyproject, manifest, and __init__")
@@ -529,6 +579,10 @@ def t_live_membership():
     res = store.add_to_group(_test_group_id, ids)  # again: no duplicates, no error
     eq(res.member_count, len(ids))
     res = store.remove_from_group(_test_group_id, ids[:1])
+    eq(res.member_count, len(ids) - 1, "removal must actually take effect")
+    total_g, rows_g = store.list_contacts(group_id=_test_group_id, limit=500)
+    truthy(ids[0] not in {r.id for r in rows_g}, "removed contact no longer listed in the group")
+    res = store.remove_from_group(_test_group_id, ids[:1])  # again: no-op, no error
     eq(res.member_count, len(ids) - 1)
     res = store.remove_from_group(_test_group_id, ["nonexistent:ABPerson"])  # ignored
     eq(res.member_count, len(ids) - 1)

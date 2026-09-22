@@ -67,12 +67,21 @@ Contacts.app's **scripting dictionary**, however, exposes `note` on `person` wit
 What that means in practice:
 
 - Notes are **only touched when explicitly requested**: `get_contact(include_notes=true)`, `get_me_card(include_notes=true)`, `set_contact_notes`, or a `notes` argument on `create_contact` / `update_contact`. Listing and searching never read notes.
-- The first such call prompts for **Automation** permission (System Settings → Privacy & Security → Automation → Claude → Contacts), separate from the Contacts permission.
+- The first such call should prompt for **Automation** permission, separate from the Contacts permission. If Contacts.app does not answer within 20 s the connector assumes the prompt was never approved, reports that with the exact System Settings path (Privacy & Security → Automation → Claude → Contacts), and fails fast for the next two minutes rather than stalling every caller. Grant it there if no prompt appeared.
 - It may launch Contacts.app in the background, and it is slow compared with the framework (hundreds of ms per call).
 - In results, `notes` is `null` when not requested **or** when unreadable — never an empty string standing in for "unknown". When unreadable, `notes_unavailable_reason` says why.
 - `merge_contacts` deletes contacts, and a deleted contact's note is gone. So it reads notes first, appends any distinct ones to the survivor, and **refuses** if a note could not be read. `ignore_notes=true` overrides that.
 
 If the framework ever does hand over notes (for example, a future signed build with the entitlement), the connector uses it automatically and the fallback never runs.
+
+---
+
+## Known limitations
+
+- **iCloud photos set through the connector are not read back.** After iCloud syncs the change, Contacts.app's own record carries the photo and displays it, but the Contacts framework's unified view reports the contact as having no image, so `get_contact_image` fails. Photos that have been on iCloud contacts for a while read fine, and On My Mac contacts work end to end. Under investigation; see the changelog.
+- **iCloud normalises some fields on sync.** A social profile's label is dropped and IM service names are rewritten (Jabber becomes `JabberInstant`). The create/update response shows what was written; a later read shows what iCloud kept.
+- Group membership changes need the raw member record inside the group's container; the connector resolves that for you, which costs one extra lookup per member on removal.
+- Linked-card management (link / unlink unified contacts) and non-Gregorian birthdays have no public API and are not exposed.
 
 ---
 
@@ -244,6 +253,9 @@ Unsigned Python interpreters launched by Claude Desktop sometimes don't trigger 
 
 **`notes` is null with a `notes_unavailable_reason`**
 Expected unless Automation permission has been granted. Enable **Claude → Contacts** under **System Settings → Privacy & Security → Automation** and try again. If Contacts.app shows a dialog, dismiss it.
+
+**A tool failed with a message like `Contact not found: …`**
+That is the intended, readable failure. If you instead see only `Error executing tool <name>`, the server hit something unexpected; the full traceback is in `~/Library/Logs/Claude/mcp-server-Apple Contacts.log`.
 
 **A label came back as `_$!<Something>!$_`**
 That is an Apple constant the connector's table does not know. It should still be displayed lowercased without the wrapper; if not, open an issue with the label text.

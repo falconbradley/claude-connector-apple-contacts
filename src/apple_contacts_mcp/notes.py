@@ -38,7 +38,14 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_TIMEOUT_S = 30.0
+_TIMEOUT_S = 20.0
+
+# After Contacts.app fails to answer once (almost always an unanswered
+# Automation prompt), later calls fail immediately for a while instead of
+# each stalling for the full timeout — a merge reads several notes in a row
+# and would otherwise overrun the MCP client's own tool timeout.
+_BACKOFF_S = 120.0
+_blocked_until = 0.0
 
 # JXA rather than AppleScript so arguments travel via argv, never string
 # interpolation — a note containing a quote must not break the script.
@@ -68,7 +75,23 @@ class NotesUnavailable(RuntimeError):
     """Notes could not be read or written; the message says why."""
 
 
+_PERMISSION_HINT = (
+    "Contacts.app did not answer within {t:.0f} s. This usually means macOS is "
+    "waiting on an Automation permission prompt for Claude that was not "
+    "approved. Check System Settings → Privacy & Security → Automation → "
+    "Claude → Contacts, then try again."
+)
+
+
 def _run(contact_id: str, mode: str, text: str = "") -> str:
+    global _blocked_until
+    import time
+    now = time.monotonic()
+    if now < _blocked_until:
+        raise NotesUnavailable(
+            _PERMISSION_HINT.format(t=_TIMEOUT_S)
+            + f" (Not retried: a call {int(_BACKOFF_S - (_blocked_until - now))} s ago timed out.)"
+        )
     try:
         proc = subprocess.run(
             ["osascript", "-l", "JavaScript", "-e", _JXA, "--", contact_id, mode, text],
@@ -79,14 +102,12 @@ def _run(contact_id: str, mode: str, text: str = "") -> str:
     except FileNotFoundError as exc:
         raise NotesUnavailable("osascript is not available on this system.") from exc
     except subprocess.TimeoutExpired as exc:
-        raise NotesUnavailable(
-            "Contacts.app did not answer within 30 s. If an Automation permission "
-            "prompt is showing, approve it and try again."
-        ) from exc
+        _blocked_until = time.monotonic() + _BACKOFF_S
+        raise NotesUnavailable(_PERMISSION_HINT.format(t=_TIMEOUT_S)) from exc
 
     if proc.returncode != 0:
         err = (proc.stderr or "").strip()
-        if "-1743" in err or "not allowed" in err.lower():
+        if "-1743" in err or "not allowed" in err.lower() or "not authorized" in err.lower():
             raise NotesUnavailable(
                 "Automation permission for Contacts.app was not granted. Enable "
                 "Claude → Contacts under System Settings → Privacy & Security → "
