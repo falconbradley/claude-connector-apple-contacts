@@ -74,8 +74,8 @@ jobs:
           import json, re, sys
           manifest = {t["name"] for t in json.load(open("manifest.json"))["tools"]}
           src = open("src/apple_contacts_mcp/server.py").read()
-          # tools are declared as @mcp.tool()-decorated defs
-          code = set(re.findall(r"@mcp\.tool\(\)\s*\ndef (\w+)", src))
+          # tools are declared as @tool- or @mcp.tool()-decorated defs
+          code = set(re.findall(r"@(?:tool|mcp\.tool\(\))\s*\ndef (\w+)", src))
           if manifest != code:
               print(f"::error::manifest/server tool mismatch")
               print(f"  only in manifest.json: {sorted(manifest - code)}")
