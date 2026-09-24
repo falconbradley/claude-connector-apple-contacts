@@ -1,6 +1,6 @@
 [project]
 name = "apple-contacts-mcp"
-version = "0.1.2"
+version = "0.2.0"
 description = "MCP server for Apple Contacts on macOS via the Contacts framework"
 readme = "README.md"
 requires-python = ">=3.11"

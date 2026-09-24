@@ -19,6 +19,13 @@ processes; the connector reads and writes them by scripting Contacts.app
 instead, which needs a separate Automation permission and is only done
 when a caller asks for notes explicitly. See notes.py.
 
+Preview card
+------------
+preview_contact renders a contact as an MCP Apps card (preview.py and
+ui/contact_preview.html), like the Apple Mail and Messages connectors'
+cards. Its Open-in-Contacts button goes through a localhost redirector
+(weblink.py), because chat hosts refuse the addressbook:// scheme.
+
 Tools provided
 --------------
 Containers & groups
@@ -35,7 +42,8 @@ Contacts — read
   list_contacts              - Filtered, paginated listing
   search_contacts            - Free-text search across names, org, emails, phones, URLs
   get_contact                - Full detail for one contact (optionally with notes)
-  get_contact_link           - addressbook:// URL that opens the contact in Contacts.app
+  preview_contact            - Same data, rendered as an inline card in the chat (MCP Apps)
+  get_contact_link           - Links (localhost http + addressbook://) that open the contact
   get_me_card                - The user's own "me" card
   get_contact_image          - Contact photo (full or thumbnail) as base64
   export_vcards              - vCard 3.0 text for one or more contacts
@@ -53,12 +61,15 @@ Contacts — write
 
 from __future__ import annotations
 
+import functools
 import logging
 import sys
-from typing import Literal, Optional
+import threading
+from typing import Callable, Literal, Optional
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import CallToolResult
 
 from . import __version__
 from .models import (
@@ -84,6 +95,15 @@ from .models import (
     VCardExport,
 )
 from .permissions import PermissionDeniedError
+from .preview import (
+    LEGACY_UI_META,
+    PREVIEW_URI,
+    build_apps,
+    build_preview_payload,
+    build_preview_result,
+    photo_data_uri,
+)
+from .weblink import WebLinkServer
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -103,26 +123,36 @@ logger = logging.getLogger("apple_contacts_mcp")
 # ---------------------------------------------------------------------------
 
 _store = None  # type: ignore[var-annotated]
+_store_lock = threading.Lock()   # the weblink thread may be first to need it
+_weblink: Optional[WebLinkServer] = None
 
 
 # ---------------------------------------------------------------------------
 # MCP server app
 # ---------------------------------------------------------------------------
 
-mcp = MCPServer(
-    "Apple Contacts",
-    instructions=(
-        "Access to Apple Contacts on this Mac via the Contacts framework. "
-        "You can list accounts (containers) and groups; search, read, create, "
-        "update, and delete contacts with every field Contacts.app shows; "
-        "manage group membership; read and set contact photos; import and "
-        "export vCards; and find and merge duplicate contacts. Contact ids are "
-        "stable and shared with Contacts.app. Notes are only read when asked "
-        "for (include_notes=true) because they go through a separate "
-        "Automation permission."
-    ),
-    version=__version__,
+INSTRUCTIONS = (
+    "Access to Apple Contacts on this Mac via the Contacts framework. "
+    "You can list accounts (containers) and groups; search, read, create, "
+    "update, and delete contacts with every field Contacts.app shows; "
+    "manage group membership; read and set contact photos; import and "
+    "export vCards; and find and merge duplicate contacts. When the user "
+    "wants to see a contact (\"show me\", \"pull up\", \"open\", \"show me "
+    "her card\"), call preview_contact: it renders the contact as a card in "
+    "the chat. Use get_contact when you only need the data yourself. "
+    "Contact ids are stable and shared with Contacts.app. Notes "
+    "are only read when asked for (include_notes=true) because they go "
+    "through a separate Automation permission."
 )
+
+# The preview tool registers through the Apps extension, which stamps
+# ``_meta.ui.resourceUri`` on it (plus the legacy flat key, for hosts that
+# still read only that). The server consumes the extension when it is
+# constructed, so -- as in the Apple Messages connector -- `mcp` is built at
+# the bottom of this module, after every tool function exists, and the plain
+# tools collected by `@tool` are added to it there.
+apps = build_apps()
+_plain_tools: list[Callable] = []
 
 
 # ---------------------------------------------------------------------------
@@ -138,19 +168,46 @@ def _require_store():
     global _store
     if _store is not None:
         return _store
-    from .contacts import ContactsStore  # heavy import deferred to first use
+    with _store_lock:
+        if _store is not None:
+            return _store
+        from .contacts import ContactsStore  # heavy import deferred to first use
+        try:
+            _store = ContactsStore()
+            logger.info("Apple Contacts MCP ready (Contacts.framework).")
+            return _store
+        except PermissionDeniedError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Could not initialise the Contacts store: {exc}") from exc
+
+
+def _resolve_contact_link(contact_id: str) -> Optional[str]:
+    """addressbook:// URL for an existing contact; None if there is no such contact."""
     try:
-        _store = ContactsStore()
-        logger.info("Apple Contacts MCP ready (Contacts.framework).")
-        return _store
-    except PermissionDeniedError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"Could not initialise the Contacts store: {exc}") from exc
+        return _require_store().get_contact_link(contact_id)
+    except ValueError:
+        return None
 
 
-def tool(fn):
-    """Register `fn` as an MCP tool and keep its failure messages.
+def _get_weblink() -> WebLinkServer:
+    global _weblink
+    if _weblink is None:
+        _weblink = WebLinkServer(resolve_link=_resolve_contact_link)
+    return _weblink
+
+
+def _open_link(contact_id: str) -> Optional[str]:
+    """Clickable http://127.0.0.1 link that opens the contact, or None."""
+    try:
+        return _get_weblink().open_link(contact_id)
+    except Exception:
+        logger.exception("Could not build open_link for %s", contact_id)
+        return None
+
+
+def _keep_messages(fn):
+    """Wrap a tool so its deliberate failures reach the client intact.
 
     The SDK reports any exception other than ToolError to the client as a
     bare "Error executing tool <name>", logging the real message server-side
@@ -158,8 +215,6 @@ def tool(fn):
     missing record, a framework refusal, a permission problem — is written
     to be read by the caller, so re-raise those as ToolError.
     """
-    import functools
-
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
@@ -169,7 +224,26 @@ def tool(fn):
         except (ValueError, RuntimeError, PermissionDeniedError) as exc:
             raise ToolError(str(exc)) from exc
 
-    return mcp.tool()(wrapper)
+    return wrapper
+
+
+def tool(fn):
+    """Register `fn` as an MCP tool, keeping its failure messages (see
+    `_keep_messages`). Added to `mcp` when it is built, at the bottom."""
+    wrapper = _keep_messages(fn)
+    _plain_tools.append(wrapper)
+    return wrapper
+
+
+def preview_tool(fn):
+    """Register `fn` as a tool whose result renders as the contact card.
+
+    `fn` returns a raw CallToolResult (structured_output=False) so the card's
+    payload rides in structuredContent while the model reads the text.
+    """
+    wrapper = _keep_messages(fn)
+    apps.tool(resource_uri=PREVIEW_URI, meta=LEGACY_UI_META, structured_output=False)(wrapper)
+    return wrapper
 
 
 def _clamp_limit(limit: int) -> int:
@@ -367,6 +441,10 @@ def get_contact(contact_id: str, include_notes: bool = False) -> ContactDetail:
     when not requested or when unreadable, with the reason in
     `notes_unavailable_reason`.
 
+    This returns data for you to use. If the user wants to *see* the
+    contact ("show me", "pull up", "open"), call preview_contact instead —
+    it renders a card in the chat.
+
     Args:
         contact_id:    Identifier from list_contacts / search_contacts.
         include_notes: Also read the note field (see above).
@@ -374,15 +452,74 @@ def get_contact(contact_id: str, include_notes: bool = False) -> ContactDetail:
     return _require_store().get_contact(contact_id, include_notes=include_notes)
 
 
+@preview_tool
+def preview_contact(contact_id: str, include_notes: bool = False) -> CallToolResult:
+    """Show a contact to the user as an inline card in the chat.
+
+    Renders the contact the way Contacts.app would: photo (or initials),
+    name, nickname, job title and company, phones, emails, addresses,
+    birthday and other dates, websites and profiles, relations, the
+    account the card lives in (iCloud, Google, …), its groups, and an
+    "Open in Contacts" button. Other cards for the same person are noted:
+    cards linked into this one, and separate cards with the same name in
+    other accounts, with the emails and phones that differ. In chat
+    clients without inline cards the tool degrades to the same JSON as
+    get_contact, plus `open_link` and `other_cards`.
+
+    Use this whenever the user asks to see, show, pull up, open, or look at
+    a contact — e.g. "show me Ada's card", "pull up the plumber's contact".
+    Use get_contact when you only need the data yourself (to answer a
+    question, draft a message, fill in another tool's arguments).
+
+    Agent guidance: the card already displays every field, so don't repeat
+    them in your reply — a one-line summary or the answer to the user's
+    question is enough. If `other_cards` lists a same-name card in another
+    account, you may mention it; it is not necessarily a duplicate.
+
+    Notes stay opt-in, as in get_contact: only with include_notes=true, which
+    scripts Contacts.app under a separate Automation permission.
+
+    Args:
+        contact_id:    Identifier from list_contacts / search_contacts.
+        include_notes: Also read and show the note field.
+    """
+    store = _require_store()
+    detail = store.get_contact(contact_id, include_notes=include_notes)
+    # Everything below is decoration: a failure in any of it must still
+    # leave the user a card, so each piece degrades on its own.
+    photo = photo_data_uri(store.get_avatar_image(contact_id)) if detail.has_image else None
+    try:
+        others = store.other_cards(contact_id)
+    except Exception:
+        logger.exception("Could not look up other cards for %s", contact_id)
+        others = []
+    for other in others:
+        if not other.linked:
+            other.open_link = _open_link(other.id)
+    payload = build_preview_payload(
+        detail,
+        photo=photo,
+        open_link=_open_link(contact_id),
+        other_cards=others,
+        is_me=store.is_me_card(contact_id),
+    )
+    return build_preview_result(payload)
+
+
 @tool
 def get_contact_link(contact_id: str) -> dict:
-    """Return an addressbook:// URL that opens the contact in Contacts.app.
+    """Return links that open the contact in Contacts.app.
+
+    `open_link` is a localhost http:// URL — use it when giving the user a
+    clickable link in chat, since chat UIs block the addressbook:// scheme.
+    `contact_link` is the raw addressbook:// URL (null `open_link` means the
+    localhost redirector could not start; fall back to `contact_link`).
 
     Args:
         contact_id: Identifier from list_contacts / search_contacts.
     """
     link = _require_store().get_contact_link(contact_id)
-    return {"contact_id": contact_id, "contact_link": link}
+    return {"contact_id": contact_id, "contact_link": link, "open_link": _open_link(contact_id)}
 
 
 @tool
@@ -688,10 +825,25 @@ def merge_contacts(
 
 
 # ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+
+# The preview tool arrives through the extension; the rest are plain tools.
+mcp = MCPServer("Apple Contacts", instructions=INSTRUCTIONS, version=__version__, extensions=[apps])
+for _fn in _plain_tools:
+    mcp.add_tool(_fn)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # Start the open-link redirector now rather than on the first link, so
+    # links in earlier transcripts work again as soon as Claude relaunches.
+    # Off-thread: binding is instant, but a busy port triggers a sibling
+    # probe that must not delay the MCP initialize response.
+    threading.Thread(target=_get_weblink().ensure_started, name="weblink-start", daemon=True).start()
     mcp.run()
 
 

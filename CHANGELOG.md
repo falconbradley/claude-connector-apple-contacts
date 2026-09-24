@@ -3,6 +3,87 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-09-23
+
+Inline contact cards, matching the preview cards the Apple Mail and Apple
+Messages connectors ship.
+
+### Added
+
+- **`preview_contact(contact_id, include_notes=false)`** renders a contact as
+  an [MCP Apps](https://modelcontextprotocol.io/specification/draft/extensions/apps)
+  card in the chat: photo or initials, name, nickname, title and company,
+  phones, emails, addresses, birthday (with a countdown when it is close) and
+  other dates, websites, profiles, relations, groups, the account the card
+  lives in, and an Open-in-Contacts button. It uses the Mail and Messages
+  cards' tokens, handshake, sizing and light/dark handling, so the three look
+  like one family. The resource is `ui://apple-contacts/contact-preview`; the
+  tool carries both the spec's `_meta.ui.resourceUri` and the legacy flat
+  `ui/resourceUri` key, and the server advertises the
+  `io.modelcontextprotocol/ui` extension. Hosts without MCP Apps get
+  `get_contact`'s JSON plus `open_link` and `other_cards`.
+- **Other cards for the same person** are noted on the card: cards linked
+  into this one (`predicateForContactsLinkedToContact:`), and separate cards
+  with the same name, typically the same person in iCloud and Google, with the
+  emails and phone numbers that differ. Emails compare case-insensitively and
+  phones by their last ten digits, so formatting differences between accounts
+  are not reported.
+- **Photos are embedded small.** The card uses Contacts' own thumbnail (with
+  the user's crop), passed through when it is under 48 KB and shrunk to a
+  192 px JPEG otherwise. In a real store 24 of 282 thumbnails were larger,
+  up to 1.2 MB; they come out at 13–17 KB. HEIC/TIFF are re-encoded, and a
+  contact with no thumbnail falls back to its full image, centre-cropped. The
+  image goes only to the card (`structuredContent`), never into the model's
+  text. An unreadable photo shows initials.
+- **Clickable open links.** Chat hosts refuse `addressbook://`, so a
+  localhost redirector (`weblink.py`, port 46327, the same design as the Mail
+  and Notes connectors') serves `http://127.0.0.1:46327/open/<id>?t=<token>`.
+  It checks that the contact exists, hands `addressbook://<id>` to macOS, and
+  closes its tab. It is bound to 127.0.0.1, token-protected, and serves no
+  contact data. It starts with the server, so links in earlier transcripts
+  work again after a relaunch. `get_contact_link` now returns `open_link` as
+  well.
+- Server instructions and `get_contact`'s description point "show me" /
+  "pull up" / "open" requests at `preview_contact`.
+- Tests: Group A checks the resource and tool metadata, that the HTML is
+  self-contained and inserts contact text only as text, photo shrinking, the
+  model/card split of the result, the other-card helpers, and the redirector
+  (token, id validation, lookup, sibling reuse). Group B previews a live card
+  with a photo and a same-name twin, and checks `get_contact_link` and the
+  error for a missing contact over the real MCP protocol, and resolves a
+  linked contact's link (read-only, skipped in a store without one). 37/37 live.
+
+### Fixed
+
+- **Links to linked contacts.** A contact joined from linked cards (say,
+  iCloud and Google) can carry a unified identifier that no account owns:
+  a bare UUID, not the `<UUID>:ABPerson` form Contacts.app uses. That was 160
+  of 813 contacts in one real store. `get_contact_link`, `get_contact`'s
+  `contact_link`, and the new open links now point at one of the linked
+  per-account cards, preferring the default account. A per-account id is
+  verified to open the right card; the screen locked before the bare-UUID
+  form could be checked, so the fix takes the safe route either way.
+  List and search results still carry the unified id (resolving it costs
+  extra lookups per row).
+- Such contacts have no container of their own, so `container_name` is null
+  for them. The preview card lists the accounts of the linked cards instead
+  (`accounts`), so it can still say where the contact lives.
+
+### Changed
+
+- `MCPServer` is constructed at the bottom of `server.py` with the Apps
+  extension, and `@tool` collects plain tools to add afterwards, as in the
+  Messages connector. The CI tool-list gate also recognises `@preview_tool`.
+- Duplicate detection and the other-card note share one name key
+  (`_name_key`), so they agree on what "the same name" means.
+
+### Notes
+
+- The Contacts name index does not tokenise every name. A surname wrapped in
+  underscores never matches, not even the card it came from. The same-name
+  lookup detects that (the card itself is missing from the results) and falls
+  back to a name-only scan.
+
 ## [0.1.2] — 2026-09-22
 
 Second live acceptance pass, this time with the live suite runnable from a

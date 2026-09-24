@@ -217,3 +217,22 @@ class MergeResult(BaseModel):
     contact: ContactDetail                    # the surviving, merged contact
     merged_ids: list[str]                     # ids that were folded in and deleted
     success: bool
+
+
+class OtherCard(BaseModel):
+    """Another card that looks like the same person, noted on the preview card.
+
+    `linked` cards are joined to the previewed one in Contacts.app's unified
+    view, so their fields already show on it. Unlinked ones are separate
+    cards with the same name — typically one person saved in two accounts,
+    such as iCloud and Google — and `only_here` / `only_there` list the
+    emails and phone numbers that differ between the two.
+    """
+    id: str
+    display_name: str
+    container_id: Optional[str] = None
+    container_name: Optional[str] = None
+    linked: bool = False
+    only_here: list[str] = []                 # on the previewed card, not this one
+    only_there: list[str] = []                # on this card, not the previewed one
+    open_link: Optional[str] = None           # clickable localhost link (unlinked cards)

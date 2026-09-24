@@ -5,8 +5,11 @@ Tests are split into two groups:
 
   Group A — Static tests (no Contacts permission required)
     Pydantic model shapes, input validation, label translation, text and
-    phone normalisation, date-component round-trips, MIME sniffing, and
-    the notes-fallback script's argument handling. Always run.
+    phone normalisation, date-component round-trips, MIME sniffing, the
+    notes-fallback script's argument handling, and the preview card: the
+    ui:// resource and tool metadata, a self-contained HTML document, photo
+    shrinking, the model/card split of the result, and the localhost
+    open-link redirector. Always run.
 
   Group B — Live Contacts tests (requires Contacts access)
     Operate against a dedicated test group named ``__claude_mcp_test__``
@@ -332,6 +335,219 @@ def t_notes_script():
         truthy("${" not in script, "no template interpolation")
         eq(script.count('Application("Contacts")'), 1)
     eq(notes._JXA, appscript._JXA_NOTE)
+
+
+# ---- Preview card (MCP Apps) ------------------------------------------------
+
+@test("A", "preview resource is registered as an MCP App")
+def t_preview_resource():
+    import asyncio
+    from apple_contacts_mcp import server
+    from apple_contacts_mcp.preview import PREVIEW_URI, preview_html
+    eq(PREVIEW_URI, "ui://apple-contacts/contact-preview", "stable URI — hosts cache templates by it")
+    resources = {str(r.uri): r for r in asyncio.run(server.mcp.list_resources())}
+    is_in(PREVIEW_URI, resources)
+    res = resources[PREVIEW_URI]
+    eq(res.mime_type, "text/html;profile=mcp-app")
+    eq((res.meta or {}).get("ui", {}).get("prefersBorder"), False, "card draws its own border, like Mail/Messages")
+    contents = list(asyncio.run(server.mcp.read_resource(PREVIEW_URI)))
+    eq(len(contents), 1)
+    eq(contents[0].mime_type, "text/html;profile=mcp-app")
+    eq(contents[0].content, preview_html())
+    # The server advertises the extension, so hosts that gate on it see it.
+    is_in("io.modelcontextprotocol/ui", server.mcp._lowlevel_server.extensions)
+
+
+@test("A", "preview_contact meta carries both resource-URI keys; other tools none")
+def t_preview_tool_meta():
+    import asyncio
+    from apple_contacts_mcp import server
+    from apple_contacts_mcp.preview import PREVIEW_URI
+    tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
+    t = tools["preview_contact"]
+    meta = t.meta or {}
+    eq((meta.get("ui") or {}).get("resourceUri"), PREVIEW_URI, "nested (spec) key")
+    eq(meta.get("ui/resourceUri"), PREVIEW_URI, "flat legacy key some hosts still read")
+    eq(t.output_schema, None, "returns a raw CallToolResult: the card payload rides in structuredContent")
+    props = (t.input_schema or {}).get("properties", {})
+    eq(sorted(props), ["contact_id", "include_notes"])
+    eq(props["include_notes"].get("default"), False, "notes stay opt-in")
+    truthy("preview_contact" in server.INSTRUCTIONS and "get_contact" in server.INSTRUCTIONS,
+           "instructions steer 'show me' requests to the card")
+    for name, other in tools.items():
+        if name != "preview_contact":
+            truthy("ui" not in (other.meta or {}) and "ui/resourceUri" not in (other.meta or {}),
+                   f"{name} must not render the card")
+
+
+@test("A", "card HTML is self-contained and speaks the Apps handshake")
+def t_preview_html():
+    import re
+    from apple_contacts_mcp.preview import preview_html
+    html = preview_html()
+    # Nothing may load from the network: the host's default CSP blocks it anyway.
+    for pattern, flags in ((r"<script[^>]*\bsrc=", re.I), (r"<link\b", re.I), (r"<iframe", re.I),
+                           (r"@import", 0), (r"url\(", 0),   # CSS url(); JS `new URL(` is fine
+                           (r"""\b(?:src|href)\s*=\s*["']?https?:""", re.I),
+                           (r"\bfetch\(", 0), (r"XMLHttpRequest", 0), (r"WebSocket", 0)):
+        truthy(not re.search(pattern, html, flags), f"external reference: {pattern}")
+    for needle in ("ui/initialize", "ui/notifications/initialized", "ui/notifications/tool-result",
+                   "ui/notifications/size-changed", "ui/open-link", 'PROTOCOL_VERSION = "2026-01-26"',
+                   "light-dark(", 'data-theme="dark"', "open_link", "other_cards", "photo"):
+        is_in(needle, html)
+    # Contact text is inserted as text; the only markup writes are the card's
+    # own constant SVG icons.
+    for m in re.finditer(r"(?:innerHTML\s*=|insertAdjacentHTML\(\s*\"[a-z]+\",)\s*([^;)]+)", html):
+        truthy(m.group(1).strip().startswith("ICONS."), f"markup fed from data: {m.group(0)}")
+    # Photos are only accepted as data: URIs of web image types.
+    is_in(r"data:image\/(jpeg|png|gif|webp);base64,", html)
+
+
+@test("A", "photo: small thumbnails pass through, big or non-web ones shrink, junk falls back")
+def t_preview_photo():
+    import base64
+    from AppKit import NSBitmapImageRep
+    from apple_contacts_mcp import contacts as c
+    from apple_contacts_mcp.preview import MAX_PHOTO_BYTES, PHOTO_SIDE_PX, photo_data_uri, shrink_to_jpeg
+    small = (ROOT / "icons" / "icon-128.png").read_bytes()
+    big = (ROOT / "icons" / "icon-512.png").read_bytes()
+    truthy(len(small) <= MAX_PHOTO_BYTES < len(big), "fixtures straddle the budget")
+    uri = photo_data_uri(small)
+    eq(uri, "data:image/png;base64," + base64.b64encode(small).decode(), "under budget: untouched")
+    uri = photo_data_uri(big)
+    truthy(uri and uri.startswith("data:image/jpeg;base64,"), "over budget: re-encoded")
+    out = base64.b64decode(uri.split(",", 1)[1])
+    truthy(len(out) <= MAX_PHOTO_BYTES, f"{len(out)} bytes")
+    rep = NSBitmapImageRep.imageRepWithData_(c._nsdata_of(out))
+    eq((rep.pixelsWide(), rep.pixelsHigh()), (PHOTO_SIDE_PX, PHOTO_SIDE_PX))
+    # A non-square source is centre-cropped, not squashed.
+    wide = shrink_to_jpeg(_png_of_size(300, 100), 64)
+    rep = NSBitmapImageRep.imageRepWithData_(c._nsdata_of(wide))
+    eq((rep.pixelsWide(), rep.pixelsHigh()), (64, 64))
+    # No photo, or bytes nothing can decode: initials.
+    eq(photo_data_uri(b""), None)
+    eq(photo_data_uri(b"\x00not an image" * 5000), None)
+
+
+def _png_of_size(w: int, h: int) -> bytes:
+    from AppKit import NSBitmapImageRep, NSBitmapImageFileTypePNG, NSDeviceRGBColorSpace
+    rep = NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(  # noqa: E501
+        None, w, h, 8, 4, True, False, NSDeviceRGBColorSpace, 0, 0)
+    return bytes(rep.representationUsingType_properties_(NSBitmapImageFileTypePNG, {}))
+
+
+@test("A", "preview result: photo only in structuredContent; model text is get_contact's JSON")
+def t_preview_result():
+    import json
+    from apple_contacts_mcp.models import ContactDetail, LabeledValue, OtherCard
+    from apple_contacts_mcp.preview import build_preview_payload, build_preview_result
+    detail = ContactDetail(id="A-1:ABPerson", display_name="Ada Lovelace", given_name="Ada",
+                           family_name="Lovelace", has_image=True, container_name="iCloud",
+                           emails=[LabeledValue(label="work", value="ada@example.com")])
+    other = OtherCard(id="B-2:ABPerson", display_name="Ada Lovelace", container_name="Google",
+                      only_here=["ada@example.com"], open_link="http://127.0.0.1:1/open/B-2:ABPerson?t=x")
+    photo = "data:image/jpeg;base64," + "A" * 4000
+    payload = build_preview_payload(detail, photo=photo, open_link="http://127.0.0.1:1/open/A-1:ABPerson?t=x",
+                                    other_cards=[other], is_me=False)
+    for key, value in detail.model_dump(mode="json").items():
+        eq(payload[key], value, f"card contract keeps get_contact's field {key!r}")
+    res = build_preview_result(payload)
+    eq(res.structured_content["photo"], photo)
+    text = res.content[0].text
+    model_view = json.loads(text)
+    truthy("photo" not in model_view and "base64" not in text, "no image bytes in the model's context")
+    eq(model_view["open_link"], payload["open_link"])
+    eq(model_view["other_cards"][0]["container_name"], "Google")
+    eq(model_view["notes"], None, "notes not read unless asked")
+    eq(res.is_error, False)
+    eq(payload["accounts"], ["iCloud"], "an unlinked same-name card is not one of this card's accounts")
+    # A linked contact whose unified id belongs to no single account: its
+    # accounts are those of the cards joined into it.
+    linked = ContactDetail(id="U-9", display_name="Grace Hopper", container_name=None)
+    cards = [OtherCard(id="R-1", display_name="Grace Hopper", container_name="iCloud", linked=True),
+             OtherCard(id="R-2", display_name="Grace Hopper", container_name="Google", linked=True),
+             OtherCard(id="R-3", display_name="Grace Hopper", container_name="USC", linked=False)]
+    payload = build_preview_payload(linked, photo=None, open_link=None, other_cards=cards, is_me=False)
+    eq(payload["accounts"], ["iCloud", "Google"])
+    eq(payload["container_name"], None, "get_contact's own field is left as the framework reports it")
+
+
+@test("A", "other-card helpers: name key and email/phone diff ignore formatting")
+def t_other_card_helpers():
+    from apple_contacts_mcp import contacts as c
+    from Contacts import CNLabeledValue, CNMutableContact, CNPhoneNumber
+
+    def card(given, family, emails=(), phones=(), org=None, kind=0):
+        m = CNMutableContact.alloc().init()
+        m.setContactType_(kind)
+        m.setGivenName_(given); m.setFamilyName_(family)
+        if org:
+            m.setOrganizationName_(org)
+        m.setEmailAddresses_([CNLabeledValue.labeledValueWithLabel_value_(None, e) for e in emails])
+        m.setPhoneNumbers_([CNLabeledValue.labeledValueWithLabel_value_(
+            None, CNPhoneNumber.phoneNumberWithStringValue_(p)) for p in phones])
+        return m
+
+    a = card("Patricia", "Chén", ["p@gmail.com", "Patti@Example.com", "pc@work.example"], ["+1 (415) 555-0199"])
+    b = card("PATRICIA", "chen", ["patti@example.com", "p@gmail.com"], ["415.555.0199", "212-555-0100"])
+    eq(c._name_key(a), c._name_key(b), "case- and accent-insensitive")
+    here, there = c._contact_value_diff(a, b)
+    eq(here, ["pc@work.example"], "same email in another case, same number formatted differently: not a difference")
+    eq(there, ["212-555-0100"])
+    eq(c._name_key(card("", "", org="Acme Ltd", kind=c.CN_TYPE_ORGANIZATION)), "acme ltd")
+    eq(c._name_key(card("", "", org="Acme Ltd")), "acme ltd", "person card with only a company")
+    eq(c._name_key(card("", "")), "")
+
+
+@test("A", "open-link redirector: token, id checks, lookup, and hand-off to Contacts")
+def t_weblink():
+    import tempfile
+    import urllib.error
+    import urllib.request
+    from apple_contacts_mcp.weblink import WebLinkServer
+
+    opened: list[str] = []
+    known = {"0F2A-11EE:ABPerson": "addressbook://0F2A-11EE:ABPerson"}
+
+    def resolve(cid):
+        if cid == "boom:ABPerson":
+            raise RuntimeError("no access")
+        return known.get(cid)
+
+    def get(url):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        state = Path(tmp) / "weblink.json"
+        wl = WebLinkServer(resolve_link=resolve, state_path=state, opener=lambda u: opened.append(u) or True,
+                           preferred_port=0)
+        try:
+            link = wl.open_link("0F2A-11EE:ABPerson")
+            truthy(link and link.startswith("http://127.0.0.1:") and "/open/0F2A-11EE:ABPerson?t=" in link, link)
+            eq(wl.open_link("../etc/passwd"), None, "ids outside the identifier alphabet get no link")
+            status, body = get(link)
+            eq(status, 200)
+            eq(opened, ["addressbook://0F2A-11EE:ABPerson"])
+            truthy("window.close" in body, "success tab closes itself")
+            truthy("0F2A" not in body, "no contact data served over HTTP")
+            base, token = link.split("/open/")[0], link.split("?t=")[1]
+            eq(get(link.split("?t=")[0] + "?t=wrong")[0], 403)
+            eq(get(f"{base}/open/gone:ABPerson?t={token}")[0], 404)
+            eq(get(f"{base}/open/boom:ABPerson?t={token}")[0], 500)
+            eq(get(f"{base}/open/..%2F..%2Fetc?t={token}")[0], 404)
+            eq(get(f"{base}/elsewhere?t={token}")[0], 404)
+            eq(len(opened), 1, "nothing else reached `open`")
+            # A second instance (Claude Desktop + Claude Code) reuses the port
+            # and token from disk instead of binding its own.
+            wl2 = WebLinkServer(resolve_link=resolve, state_path=state, opener=lambda u: True)
+            eq(wl2.open_link("0F2A-11EE:ABPerson"), link, "sibling emits identical links")
+            eq(wl2._httpd, None, "sibling serves nothing itself")
+        finally:
+            wl.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +876,148 @@ def t_live_dupes_merge():
         is_in(_test_group_id, m.group_ids, "survivor joined the other's group")
     raises(ValueError, lambda: store.get_contact(b.id))
     _created_contact_ids.remove(b.id)
+
+
+def _server_on(store):
+    """The server module wired to the test's store and a private redirector.
+
+    The redirector gets a throwaway state file and an ephemeral port, so a
+    test run never touches the installed connector's persisted token or port.
+    """
+    import tempfile
+    from apple_contacts_mcp import server
+    from apple_contacts_mcp.weblink import WebLinkServer
+    server._store = store
+    if server._weblink is None or server._weblink._state_path.name != "test-weblink.json":
+        server._weblink = WebLinkServer(
+            resolve_link=server._resolve_contact_link,
+            state_path=Path(tempfile.mkdtemp()) / "test-weblink.json",
+            opener=lambda url: True,       # never actually front Contacts.app
+            preferred_port=0,
+        )
+    return server
+
+
+@test("B", "preview_contact renders a card: thumbnail photo, links, other cards, no notes")
+def t_live_preview():
+    import base64, json
+    from mcp.types import CallToolResult
+    from apple_contacts_mcp.models import LabeledValue, PartialDate, PostalAddress
+    from apple_contacts_mcp.preview import MAX_PHOTO_BYTES
+    store = _store_or_skip()
+    server = _server_on(store)
+    a = _make(store, "Pia", scalars={"nickname": "P", "organization_name": "Card Co", "job_title": "Tester"},
+              emails=[LabeledValue(label="work", value="pia@example.com"),
+                      LabeledValue(label="home", value="shared@example.com")],
+              phones=[LabeledValue(label="mobile", value="+1 (415) 555-0142")],
+              postal_addresses=[PostalAddress(label="home", street="1 Infinite Loop", city="Cupertino",
+                                              state="CA", postal_code="95014", country="United States")],
+              birthday=PartialDate(month=3, day=14))
+    # The same person saved again, as if in a second account: a separate card
+    # with the same name, one email in common and one of its own.
+    b = _make(store, "Pia", emails=[LabeledValue(label="home", value="SHARED@example.com"),
+                                    LabeledValue(label="other", value="pia.alt@example.org")],
+              phones=[LabeledValue(label="mobile", value="415-555-0142")])
+    png = (ROOT / "icons" / "icon-512.png").read_bytes()
+    store.set_contact_image(a.id, image_base64=base64.b64encode(png).decode())
+
+    res = server.preview_contact(contact_id=a.id)
+    truthy(isinstance(res, CallToolResult), type(res).__name__)
+    eq(res.is_error, False)
+    card = res.structured_content
+    eq(card["id"], a.id)
+    eq(card["nickname"], "P")
+    eq(card["organization_name"], "Card Co")
+    eq([e["value"] for e in card["emails"]], ["pia@example.com", "shared@example.com"])
+    eq(card["birthday"], {"year": None, "month": 3, "day": 14})
+    truthy(card["postal_addresses"][0]["formatted"], "address carries the system-formatted label")
+    not_none(card["container_name"], "the card names its account")
+    eq(card["is_me"], False)
+    truthy((card["open_link"] or "").startswith("http://127.0.0.1:"), card["open_link"])
+    eq(card["notes"], None, "notes are never read unless include_notes")
+    eq(card["notes_unavailable_reason"], None, "…and not even attempted")
+
+    # Photo: embedded small, never the full image. A photo just set on an
+    # iCloud card can be unreadable through the framework for a while (see
+    # get_contact_image); then the card must fall back to initials.
+    if card["photo"] is None:
+        eq(store.get_avatar_image(a.id), b"", "initials only when the framework returned no image")
+    else:
+        truthy(card["photo"].startswith(("data:image/jpeg;base64,", "data:image/png;base64,")), card["photo"][:40])
+        truthy(len(base64.b64decode(card["photo"].split(",", 1)[1])) <= MAX_PHOTO_BYTES, "under the photo budget")
+
+    # The model's text: get_contact's JSON plus links, and no image bytes.
+    text = res.content[0].text
+    view = json.loads(text)
+    truthy("photo" not in view and "base64" not in text, "no photo in the model's context")
+    eq(view["id"], a.id)
+    truthy(len(text) < 20000, f"model text stays small ({len(text)} chars)")
+
+    others = {o["id"]: o for o in card["other_cards"]}
+    is_in(b.id, others, "the same-name card is noted")
+    o = others[b.id]
+    eq(o["linked"], False)
+    eq(o["only_here"], ["pia@example.com"], "shared email (other case) and the reformatted phone don't count")
+    eq(o["only_there"], ["pia.alt@example.org"])
+    truthy((o["open_link"] or "").startswith("http://127.0.0.1:"), "separate cards get their own Open link")
+    not_none(o["container_name"])
+
+    # The link actually resolves through the redirector's lookup.
+    eq(server._resolve_contact_link(a.id), f"addressbook://{a.id}")
+    eq(server._resolve_contact_link("does-not-exist:ABPerson"), None)
+
+
+@test("B", "over the MCP protocol: card payload in structuredContent, readable errors, open_link on get_contact_link")
+def t_live_protocol():
+    import asyncio, json
+    from mcp.client import Client
+    store = _store_or_skip()
+    server = _server_on(store)
+    pia = next(r for r in store.list_contacts(text="Pia " + TEST_FAMILY, limit=50)[1] if r.given_name == "Pia")
+
+    async def run():
+        async with Client(server.mcp) as client:
+            ok = await client.call_tool("preview_contact", {"contact_id": pia.id})
+            missing = await client.call_tool("preview_contact", {"contact_id": "does-not-exist:ABPerson"})
+            links = await client.call_tool("get_contact_link", {"contact_id": pia.id})
+            return ok, missing, links
+
+    ok, missing, links = asyncio.run(run())
+    # What the host hands the iframe, after the SDK's own serialisation.
+    eq(ok.is_error, False)
+    eq((ok.structured_content or {}).get("id"), pia.id, "raw CallToolResult passes through with its payload")
+    is_in("other_cards", ok.structured_content)
+    truthy("photo" not in json.loads(ok.content[0].text), "the model's text never carries the photo")
+    eq(missing.is_error, True)
+    is_in("not found", missing.content[0].text.lower(), "the reason survives, not a bare SDK error")
+    d = json.loads(links.content[0].text)
+    eq(d["contact_link"], f"addressbook://{pia.id}")
+    truthy((d["open_link"] or "").startswith("http://127.0.0.1:") and pia.id in d["open_link"], d)
+
+
+@test("B", "linked contacts: links resolve to a per-account card; the card lists every account")
+def t_live_linked():
+    # Read-only against whatever the store holds: there is no public API to
+    # link cards, so the test cannot make its own. Skips if none exist.
+    import Contacts as CN
+    from Contacts import CNContact
+    store = _store_or_skip()
+    server = _server_on(store)
+    keys = [CN.CNContactIdentifierKey]
+    raw = {str(c.identifier()) for c in store._fetch(keys, unify=False)}
+    orphan = next((str(c.identifier()) for c in store._fetch(keys) if str(c.identifier()) not in raw), None)
+    if orphan is None:
+        skip("no linked contact with an account-less unified id in this store")
+    linked = [str(c.identifier()) for c in store._fetch(
+        keys, CNContact.predicateForContactsLinkedToContact_(store._fetch_one(orphan, keys)), unify=False)]
+    truthy(linked, "an account-less unified contact is made of linked cards")
+    link = store.get_contact_link(orphan)
+    is_in(link[len("addressbook://"):], linked, "link targets one of the linked cards, which Contacts.app knows")
+    eq(store.get_contact(orphan).contact_link, link, "get_contact agrees")
+    card = server.preview_contact(contact_id=orphan).structured_content
+    eq(card["container_name"], None)
+    truthy(len(card["accounts"]) >= 1, "…but the card still says where it lives")
+    truthy(all(o["linked"] for o in card["other_cards"] if o["id"] in linked))
 
 
 @test("B", "delete contact and group; missing ids raise ValueError")

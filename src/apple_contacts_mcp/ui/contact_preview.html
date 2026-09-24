@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Apple Contacts — Contact Preview</title>
+<!--
+  MCP App (SEP-1865) for the Apple Contacts connector.
+
+  Claude renders this document in a sandboxed iframe when `preview_contact`
+  runs. The host speaks JSON-RPC 2.0 over window.postMessage; we do the
+  handshake by hand (no SDK) so the file stays a single self-contained HTML
+  document that satisfies the restrictive default CSP:
+
+      default-src 'none'; script-src 'self' 'unsafe-inline';
+      style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'
+
+  Nothing here loads from the network: the photo arrives as a data: URI in the
+  tool result. Contact text is inserted as text, never as markup. The card
+  chrome (tokens, header, footer, states, sizing) mirrors the Apple Mail
+  connector's email_preview.html and the Apple Messages connector's
+  message_preview.html so the three read as one family — keep them in step.
+-->
+<style>
+  :root {
+    /* Fallbacks for every host variable we rely on (spec: Views must
+       degrade gracefully when the host omits `styles`). Same set and values
+       as the Mail and Messages cards. */
+    --color-background-primary: light-dark(#ffffff, #1f1f1f);
+    --color-background-secondary: light-dark(#f5f5f4, #2a2a2a);
+    --color-background-tertiary: light-dark(#ebebea, #343434);
+    --color-background-info: light-dark(#e8f1fb, #1d2b3a);
+    --color-background-danger: light-dark(#fdecec, #3a1f1f);
+    --color-text-primary: light-dark(#1a1a1a, #f2f2f2);
+    --color-text-secondary: light-dark(#5c5c5c, #b3b3b3);
+    --color-text-tertiary: light-dark(#8a8a8a, #8a8a8a);
+    --color-text-info: light-dark(#1d5fa8, #8ab8ee);
+    --color-text-danger: light-dark(#b42318, #f39a92);
+    --color-border-primary: light-dark(#e2e2e0, #3a3a3a);
+    --color-border-secondary: light-dark(#ececeb, #333333);
+    --color-ring-primary: light-dark(#1d5fa8, #8ab8ee);
+    --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --font-weight-normal: 400;
+    --font-weight-medium: 500;
+    --font-weight-semibold: 600;
+    --font-text-xs-size: 11px;
+    --font-text-sm-size: 12.5px;
+    --font-text-md-size: 14px;
+    --font-text-lg-size: 16px;
+    --font-heading-sm-size: 17px;
+    --border-radius-sm: 6px;
+    --border-radius-md: 10px;
+    --border-radius-lg: 14px;
+    --border-radius-full: 9999px;
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
+    color-scheme: light dark;
+  }
+  :root[data-theme="light"] { color-scheme: light; }
+  :root[data-theme="dark"]  { color-scheme: dark; }
+
+  html, body { margin: 0; padding: 0; background: transparent; }
+  body {
+    font-family: var(--font-sans);
+    font-size: var(--font-text-md-size);
+    line-height: 1.45;
+    color: var(--color-text-primary);
+    -webkit-font-smoothing: antialiased;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+
+  .card {
+    background: var(--color-background-primary);
+    border: 1px solid var(--color-border-primary);
+    border-radius: var(--border-radius-lg);
+    overflow: hidden;
+  }
+  :root[data-host-border="true"] .card { border: none; border-radius: 0; }
+
+  /* ---- Header ------------------------------------------------------- */
+  .hdr {
+    display: flex; gap: 14px; align-items: center;
+    padding: 14px 16px 12px;
+  }
+  .avatar {
+    flex: 0 0 56px; width: 56px; height: 56px; border-radius: var(--border-radius-full);
+    display: grid; place-items: center; overflow: hidden;
+    color: #fff; font-weight: var(--font-weight-semibold); font-size: 21px;
+    letter-spacing: 0.02em; user-select: none;
+    background: var(--avatar-bg, #6b7280);
+  }
+  .avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .avatar svg { width: 28px; height: 28px; }
+  .avatar.photo { background: var(--color-background-tertiary); box-shadow: 0 0 0 1px var(--color-border-secondary) inset; }
+  .who { flex: 1 1 auto; min-width: 0; }
+  .name {
+    font-weight: var(--font-weight-semibold); font-size: var(--font-heading-sm-size);
+    line-height: 1.3; overflow-wrap: anywhere;
+  }
+  .sub {
+    color: var(--color-text-secondary); font-size: var(--font-text-sm-size);
+    margin-top: 2px; overflow-wrap: anywhere;
+  }
+  .sub .nick { color: var(--color-text-primary); }
+  .meta { flex: 0 0 auto; align-self: flex-start; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+  .tag {
+    font-size: var(--font-text-xs-size); font-weight: var(--font-weight-semibold); letter-spacing: .02em;
+    padding: 1px 8px; border-radius: var(--border-radius-full); white-space: nowrap;
+    color: var(--color-text-secondary); background: var(--color-background-tertiary);
+  }
+  .tag.me { color: #fff; background: #2f6fed; }
+
+  /* ---- Body --------------------------------------------------------- */
+  .body-wrap { position: relative; border-top: 1px solid var(--color-border-secondary); }
+  .body { max-height: 420px; overflow: hidden; }
+  .body.expanded { max-height: none; }
+  .body-wrap.overflows:not(.expanded-wrap)::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 64px;
+    pointer-events: none;
+    background: linear-gradient(to bottom, transparent, var(--color-background-primary));
+  }
+
+  /* One section per kind of field (phones, emails, addresses, dates, …),
+     label column on the left like Contacts.app. The column is a fixed width
+     so values line up across sections; long custom labels are ellipsised. */
+  .section {
+    display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 5px 14px;
+    margin: 0; padding: 10px 16px; align-items: baseline;
+  }
+  .section + .section { border-top: 1px solid var(--color-border-secondary); }
+  .section dt {
+    margin: 0; color: var(--color-text-tertiary); font-size: var(--font-text-sm-size);
+    text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .section dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+  .section dd.multiline { white-space: pre-line; }
+  .section dd .dim { color: var(--color-text-tertiary); font-size: var(--font-text-sm-size); }
+  .section dd.note { white-space: pre-wrap; }
+  .section dd.unavailable { color: var(--color-text-tertiary); font-size: var(--font-text-sm-size); font-style: italic; }
+  a[href] { color: var(--color-text-info); text-decoration: none; cursor: pointer; }
+  a[href]:hover { text-decoration: underline; text-underline-offset: 2px; }
+  a[href]:focus-visible { outline: 2px solid var(--color-ring-primary); border-radius: 3px; }
+
+  /* ---- Other cards for the same person ------------------------------ */
+  .others { border-top: 1px solid var(--color-border-secondary); background: var(--color-background-info); }
+  .other {
+    display: flex; gap: 10px; align-items: center;
+    padding: 8px 16px; font-size: var(--font-text-sm-size); color: var(--color-text-secondary);
+  }
+  .other + .other { border-top: 1px solid var(--color-border-secondary); }
+  .other svg { flex: 0 0 14px; width: 14px; height: 14px; color: var(--color-text-info); }
+  .other .txt { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+  .other b { color: var(--color-text-primary); font-weight: var(--font-weight-semibold); }
+  .other .diff { color: var(--color-text-tertiary); }
+
+  /* ---- Footer / actions --------------------------------------------- */
+  .ftr {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 10px 16px 12px; border-top: 1px solid var(--color-border-secondary);
+    background: var(--color-background-secondary);
+  }
+  .btn {
+    appearance: none; border: 1px solid var(--color-border-primary);
+    background: var(--color-background-primary); color: var(--color-text-primary);
+    border-radius: var(--border-radius-md); padding: 6px 12px;
+    font: inherit; font-size: var(--font-text-sm-size); font-weight: var(--font-weight-medium);
+    cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+    box-shadow: var(--shadow-sm);
+  }
+  .btn:hover { background: var(--color-background-tertiary); }
+  .btn:focus-visible { outline: 2px solid var(--color-ring-primary); outline-offset: 1px; }
+  .btn.primary { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+  .btn.primary:hover { background: #2861d1; }
+  .btn svg { width: 14px; height: 14px; }
+  .btn.ghost { border-color: transparent; background: transparent; box-shadow: none; color: var(--color-text-secondary); }
+  .btn.ghost:hover { background: var(--color-background-tertiary); color: var(--color-text-primary); }
+  .btn.small { padding: 3px 9px; font-size: var(--font-text-xs-size); }
+  .spacer { flex: 1 1 auto; }
+  .footnote { color: var(--color-text-tertiary); font-size: var(--font-text-xs-size); }
+
+  /* ---- States ------------------------------------------------------- */
+  .state { padding: 16px; color: var(--color-text-secondary); font-size: var(--font-text-sm-size); }
+  .state.error { color: var(--color-text-danger); background: var(--color-background-danger); white-space: pre-wrap; }
+  .empty { padding: 22px 16px; text-align: center; color: var(--color-text-tertiary); font-size: var(--font-text-sm-size); }
+  .skel { height: 12px; border-radius: 6px; background: var(--color-background-tertiary); margin: 8px 0; animation: pulse 1.4s ease-in-out infinite; }
+  .skel.w40 { width: 40%; } .skel.w70 { width: 70%; } .skel.w90 { width: 90%; }
+  @keyframes pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <div id="loading" class="state" aria-live="polite">
+    <div class="skel w40"></div>
+    <div class="skel w70"></div>
+    <div class="skel w90"></div>
+    <span class="sr">Loading contact</span>
+  </div>
+  <div id="error" class="state error" hidden></div>
+  <div id="content" hidden>
+    <div class="hdr">
+      <div class="avatar" id="avatar" aria-hidden="true"></div>
+      <div class="who">
+        <div class="name" id="name"></div>
+        <div class="sub" id="sub"></div>
+      </div>
+      <div class="meta" id="meta"></div>
+    </div>
+    <div class="body-wrap" id="bodyWrap">
+      <div class="body" id="body"></div>
+    </div>
+    <div class="others" id="others" hidden></div>
+    <div class="ftr">
+      <button class="btn primary" id="openBtn" type="button">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11" rx="1.8"/><circle cx="8" cy="6.6" r="1.9"/><path d="M4.6 11.4c.6-1.4 1.9-2.2 3.4-2.2s2.8.8 3.4 2.2"/></svg>
+        Open in Contacts
+      </button>
+      <button class="btn ghost" id="moreBtn" type="button" hidden>Show all</button>
+      <span class="spacer"></span>
+      <span class="footnote" id="footnote"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ====================================================================
+  // JSON-RPC over postMessage (View side of the MCP Apps protocol)
+  // ====================================================================
+  var PROTOCOL_VERSION = "2026-01-26";
+  var APP_INFO = { name: "Apple Contacts Contact Preview", version: "1.0.0" };
+  var nextId = 1;
+  var pending = new Map();
+  var hostContext = {};
+  var hostCapabilities = {};
+  var connected = false;
+
+  function post(msg) { window.parent.postMessage(msg, "*"); }
+  function request(method, params) {
+    return new Promise(function (resolve, reject) {
+      var id = nextId++;
+      pending.set(id, { resolve: resolve, reject: reject });
+      post({ jsonrpc: "2.0", id: id, method: method, params: params || {} });
+    });
+  }
+  function notify(method, params) { post({ jsonrpc: "2.0", method: method, params: params || {} }); }
+  function respond(id, result) { post({ jsonrpc: "2.0", id: id, result: result }); }
+  function respondError(id, code, message) { post({ jsonrpc: "2.0", id: id, error: { code: code, message: message } }); }
+
+  window.addEventListener("message", function (ev) {
+    if (ev.source !== window.parent) return;
+    var m = ev.data;
+    if (!m || m.jsonrpc !== "2.0") return;
+    if (m.method === undefined && m.id !== undefined) {           // response to us
+      var p = pending.get(m.id);
+      if (!p) return;
+      pending.delete(m.id);
+      if (m.error) p.reject(m.error); else p.resolve(m.result);
+      return;
+    }
+    if (m.id !== undefined) handleRequest(m); else handleNotification(m);
+  });
+
+  function handleRequest(m) {
+    switch (m.method) {
+      case "ping":
+      case "ui/resource-teardown":
+        respond(m.id, {}); break;
+      default:
+        respondError(m.id, -32601, "Method not found: " + m.method);
+    }
+  }
+
+  function handleNotification(m) {
+    var p = m.params || {};
+    switch (m.method) {
+      case "ui/notifications/tool-input":
+      case "ui/notifications/tool-input-partial":
+        break;
+      case "ui/notifications/tool-result":
+        onToolResult(p); break;
+      case "ui/notifications/tool-cancelled":
+        showError("Preview cancelled" + (p.reason ? ": " + p.reason : ".")); break;
+      case "ui/notifications/host-context-changed":
+        applyHostContext(Object.assign(hostContext, p)); break;
+      default: break;
+    }
+  }
+
+  function connect() {
+    request("ui/initialize", {
+      appInfo: APP_INFO,
+      appCapabilities: { availableDisplayModes: ["inline"] },
+      protocolVersion: PROTOCOL_VERSION
+    }).then(function (result) {
+      result = result || {};
+      hostCapabilities = result.hostCapabilities || {};
+      hostContext = result.hostContext || {};
+      applyHostContext(hostContext);
+      connected = true;
+      notify("ui/notifications/initialized", {});
+      startSizeReporting();
+    }).catch(function (err) {
+      console.error("ui/initialize failed", err);
+      startSizeReporting();
+    });
+  }
+
+  // ====================================================================
+  // Host context: theme, style variables, fonts, dimensions
+  // ====================================================================
+  function applyHostContext(ctx) {
+    var root = document.documentElement;
+    if (ctx.theme === "light" || ctx.theme === "dark") root.setAttribute("data-theme", ctx.theme);
+    if (ctx.styles && ctx.styles.variables) {
+      Object.keys(ctx.styles.variables).forEach(function (k) {
+        var v = ctx.styles.variables[k];
+        if (/^--[a-z0-9-]+$/i.test(k) && typeof v === "string") root.style.setProperty(k, v);
+      });
+    }
+    if (ctx.styles && ctx.styles.css && typeof ctx.styles.css.fonts === "string") {
+      var el = document.getElementById("hostFonts");
+      if (!el) { el = document.createElement("style"); el.id = "hostFonts"; document.head.appendChild(el); }
+      el.textContent = ctx.styles.css.fonts;
+    }
+    var dims = ctx.containerDimensions;
+    if (dims) {
+      root.style.height = ("height" in dims) ? "100vh" : "";
+      root.style.maxHeight = (!("height" in dims) && dims.maxHeight) ? dims.maxHeight + "px" : "";
+      root.style.overflowY = (("height" in dims) || dims.maxHeight) ? "auto" : "";
+      root.style.width = ("width" in dims) ? "100vw" : "";
+      root.style.maxWidth = (!("width" in dims) && dims.maxWidth) ? dims.maxWidth + "px" : "";
+    }
+    if (ctx.safeAreaInsets) {
+      var s = ctx.safeAreaInsets;
+      document.body.style.padding = (s.top|0) + "px " + (s.right|0) + "px " + (s.bottom|0) + "px " + (s.left|0) + "px";
+    }
+  }
+
+  var lastW = -1, lastH = -1;
+  // Synchronous on purpose (as in the Messages card): ResizeObserver already
+  // coalesces per frame, and a requestAnimationFrame here would stall while
+  // the iframe is off-screen or the host tab is hidden.
+  function reportSize() {
+    decideCollapse();
+    var card = document.getElementById("card");
+    var h = Math.ceil(card.getBoundingClientRect().height + bodyPad("Top") + bodyPad("Bottom"));
+    var w = Math.ceil(document.documentElement.getBoundingClientRect().width);
+    if (!h) return;                                    // display:none, nothing to say
+    // Past the host's ceiling the document scrolls internally; don't ask
+    // for more than it will give.
+    var dims = hostContext.containerDimensions || {};
+    if (!("height" in dims) && dims.maxHeight) h = Math.min(h, dims.maxHeight);
+    if (h === lastH && w === lastW) return;
+    lastH = h; lastW = w;
+    notify("ui/notifications/size-changed", { width: w, height: h });
+  }
+  function bodyPad(side) { return parseFloat(getComputedStyle(document.body)["padding" + side]) || 0; }
+  function startSizeReporting() {
+    if (window.ResizeObserver) {
+      var ro = new ResizeObserver(reportSize);
+      ro.observe(document.documentElement);
+      ro.observe(document.body);
+      ro.observe(document.getElementById("card"));
+    }
+    reportSize();
+  }
+
+  // Whether a long card needs a "Show all" fold depends on how its text
+  // wraps, and a frame that has not been laid out yet (hidden tab, iframe
+  // still at zero size) wraps every word onto its own line and looks miles
+  // tall. So the decision waits for a real width; the ResizeObserver path
+  // through reportSize() retries it once the frame has one.
+  var pendingCollapse = null;
+  function decideCollapse() {
+    if (!pendingCollapse || !document.documentElement.clientWidth) return;
+    var decide = pendingCollapse;
+    pendingCollapse = null;
+    decide();
+  }
+
+  // ====================================================================
+  // Rendering
+  // ====================================================================
+  var $ = function (id) { return document.getElementById(id); };
+  var contact = null;        // structuredContent from the tool result
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function textOf(content) {
+    if (!Array.isArray(content)) return "";
+    return content.filter(function (c) { return c && c.type === "text"; })
+                  .map(function (c) { return c.text; }).join("\n");
+  }
+
+  function onToolResult(result) {
+    if (result.isError) {
+      showError(textOf(result.content) || "The contact could not be loaded.");
+      return;
+    }
+    var sc = result.structuredContent;
+    if (!sc || typeof sc !== "object") {
+      // Fallback: the server might have put JSON in the text content.
+      try { sc = JSON.parse(textOf(result.content)); } catch (e) { sc = null; }
+    }
+    if (!sc || !sc.id) { showError("No contact data in the tool result."); return; }
+    contact = sc;
+    try { render(); }
+    catch (err) { showError("Could not render this contact: " + (err && err.message || err)); }
+  }
+
+  function showError(text) {
+    $("loading").hidden = true;
+    $("content").hidden = true;
+    var e = $("error"); e.textContent = text; e.hidden = false;
+    reportSize();
+  }
+
+  function render() {
+    var c = contact;
+    renderAvatar(c);
+    $("name").textContent = c.display_name || "(no name)";
+    renderSub(c);
+    renderMeta(c);
+    renderBody(c);
+    renderOthers(c);
+    $("openBtn").hidden = !(c.open_link || c.contact_link);
+    $("footnote").textContent = (c.group_names || []).join(" · ");
+    $("footnote").title = (c.group_names || []).length ? "Groups" : "";
+
+    $("loading").hidden = true;
+    $("error").hidden = true;
+    $("content").hidden = false;
+    armCollapse();
+    reportSize();
+  }
+
+  // ---- Header ----------------------------------------------------------
+  var ICONS = {
+    person: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5v.5H4z"/></svg>',
+    building: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M5 21V4.5A1.5 1.5 0 0 1 6.5 3h7A1.5 1.5 0 0 1 15 4.5V9h2.5A1.5 1.5 0 0 1 19 10.5V21h1v1.5H4V21zm3-14v2h2V7zm4 0v2h2V7zm-4 4v2h2v-2zm4 0v2h2v-2zm4 1v2h1.5v-2zm-8 3v2h2v-2zm4 0v2h2v-2zm4 1v2h1.5v-2zm-6 3v3h3v-3z"/></svg>',
+    link: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M6.8 9.2a2.6 2.6 0 0 0 3.7 0l2.3-2.3a2.6 2.6 0 0 0-3.7-3.7l-.8.8"/><path d="M9.2 6.8a2.6 2.6 0 0 0-3.7 0L3.2 9.1a2.6 2.6 0 0 0 3.7 3.7l.8-.8"/></svg>',
+    cards: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><rect x="1.8" y="4.2" width="9.5" height="8.6" rx="1.5"/><path d="M4.6 2.2h8.1a1.5 1.5 0 0 1 1.5 1.5v6.9"/></svg>'
+  };
+
+  function renderAvatar(c) {
+    var av = $("avatar");
+    av.textContent = "";
+    av.className = "avatar";
+    av.style.removeProperty("--avatar-bg");
+    if (typeof c.photo === "string" && /^data:image\/(jpeg|png|gif|webp);base64,/.test(c.photo)) {
+      var img = document.createElement("img");
+      img.alt = "";
+      img.src = c.photo;
+      // A photo that fails to decode falls back to initials, not a broken icon.
+      img.addEventListener("error", function () { contact.photo = null; renderAvatar(contact); reportSize(); });
+      av.appendChild(img);
+      av.classList.add("photo");
+      return;
+    }
+    // Keyed like the Mail card (lower-cased address first), so a person's
+    // colour matches across the family's cards.
+    av.style.setProperty("--avatar-bg", avatarColor(c.primary_email || c.primary_phone || c.display_name || c.id));
+    if (c.kind === "organization") { av.innerHTML = ICONS.building; return; }
+    var ini = initials(personName(c));
+    if (ini === "?" || ini === "#") { av.innerHTML = ICONS.person; return; }
+    av.textContent = ini;
+  }
+
+  function personName(c) {
+    var n = [c.given_name, c.family_name].filter(Boolean).join(" ");
+    return n || c.organization_name || c.display_name || "";
+  }
+
+  function renderSub(c) {
+    var sub = $("sub");
+    sub.textContent = "";
+    var parts = [];
+    if (c.nickname) {
+      var n = el("span", "nick", "“" + c.nickname + "”");
+      parts.push(n);
+    }
+    var role = [];
+    if (c.kind === "organization") {
+      if (c.department_name) role.push(c.department_name);
+    } else {
+      var title = [c.job_title, c.department_name].filter(Boolean).join(", ");
+      if (title) role.push(title);
+      if (c.organization_name) role.push(c.organization_name);
+    }
+    if (role.length) parts.push(document.createTextNode(role.join(" · ")));
+    parts.forEach(function (p, i) {
+      if (i) sub.appendChild(document.createTextNode(" · "));
+      sub.appendChild(p);
+    });
+    sub.hidden = parts.length === 0;
+  }
+
+  function renderMeta(c) {
+    var meta = $("meta");
+    meta.textContent = "";
+    // Every account the card's fields come from: a linked contact spans
+    // several and may have no container of its own.
+    var accounts = Array.isArray(c.accounts) && c.accounts.length ? c.accounts
+                 : (c.container_name ? [c.container_name] : []);
+    accounts.slice(0, 3).forEach(function (name) {
+      var t = el("span", "tag", name);
+      t.title = accounts.length > 1 ? "Linked across accounts" : "Account";
+      meta.appendChild(t);
+    });
+    if (c.is_me) meta.appendChild(el("span", "tag me", "Me"));
+    meta.hidden = !meta.childNodes.length;
+  }
+
+  // ---- Body ------------------------------------------------------------
+  function renderBody(c) {
+    var body = $("body");
+    body.textContent = "";
+    var sections = [];
+
+    sections.push((c.phones || []).map(function (p) {
+      return row(p.label || "phone", link(p.value, telHref(p.value)));
+    }));
+    sections.push((c.emails || []).map(function (e) {
+      return row(e.label || "email", link(e.value, "mailto:" + e.value));
+    }));
+    sections.push((c.postal_addresses || []).map(function (a) {
+      var dd = el("dd", "multiline", formatAddress(a));
+      return row(a.label || "address", dd);
+    }));
+
+    var dates = [];
+    if (c.birthday) dates.push(row("birthday", birthdayValue(c.birthday)));
+    (c.dates || []).forEach(function (d) { dates.push(row(d.label || "date", formatPartialDate(d.date))); });
+    sections.push(dates);
+
+    var online = [];
+    (c.urls || []).forEach(function (u) { online.push(row(u.label || "url", link(u.value, webHref(u.value)))); });
+    (c.social_profiles || []).forEach(function (s) {
+      var name = s.username || s.user_identifier || s.url || "";
+      online.push(row(serviceName(s.service) || s.label || "profile", link(name, webHref(s.url))));
+    });
+    (c.instant_messages || []).forEach(function (m) {
+      online.push(row(serviceName(m.service) || m.label || "chat", m.username));
+    });
+    sections.push(online);
+
+    var people = (c.relations || []).map(function (r) { return row(r.label || "related", r.value); });
+    if (c.previous_family_name) people.push(row("maiden name", c.previous_family_name));
+    sections.push(people);
+
+    if (c.notes) {
+      sections.push([row("note", el("dd", "note", c.notes))]);
+    } else if (c.notes_unavailable_reason) {
+      sections.push([row("note", el("dd", "unavailable", "Not read — " + c.notes_unavailable_reason))]);
+    }
+
+    sections = sections.filter(function (rows) { return rows.length; });
+    if (!sections.length) {
+      body.appendChild(el("div", "empty", "No phone numbers, emails, or other details on this card."));
+      return;
+    }
+    sections.forEach(function (rows) {
+      var dl = el("dl", "section");
+      rows.forEach(function (r) { dl.appendChild(r[0]); dl.appendChild(r[1]); });
+      body.appendChild(dl);
+    });
+    body.querySelectorAll("a[href]").forEach(function (a) {
+      a.addEventListener("click", function (ev) { ev.preventDefault(); openLink(a.getAttribute("href")); });
+    });
+  }
+
+  // A row is [dt, dd]; `value` is text, an element to wrap, or a ready <dd>.
+  function row(label, value) {
+    var dt = el("dt", "", label);
+    dt.title = label;
+    var dd;
+    if (value && value.nodeType === 1 && value.tagName === "DD") dd = value;
+    else {
+      dd = el("dd");
+      if (value && value.nodeType) dd.appendChild(value); else dd.textContent = value == null ? "" : String(value);
+    }
+    return [dt, dd];
+  }
+
+  // Links only for schemes a host might open; everything else is plain text.
+  function link(text, href) {
+    if (!href) return document.createTextNode(text || "");
+    var a = el("a", "", text || href);
+    a.href = href;
+    a.rel = "noopener noreferrer";
+    return a;
+  }
+  function telHref(v) {
+    var d = String(v || "").replace(/[^\d+*#,;]/g, "");
+    return /\d/.test(d) ? "tel:" + d : null;
+  }
+  function webHref(v) {
+    var s = String(v || "").trim();
+    if (!s) return null;
+    if (!/^[a-z][a-z0-9+.-]*:/i.test(s)) s = "https://" + s.replace(/^\/+/, "");
+    try {
+      var u = new URL(s);
+      return (u.protocol === "http:" || u.protocol === "https:") && u.hostname ? u.href : null;
+    } catch (e) { return null; }
+  }
+  function serviceName(s) {
+    s = String(s || "").trim();
+    return s && s === s.toLowerCase() ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+  }
+
+  function formatAddress(a) {
+    if (a.formatted && a.formatted.trim()) return a.formatted.trim();
+    var line2 = [a.city, [a.state, a.postal_code].filter(Boolean).join(" ")].filter(Boolean).join(", ");
+    return [a.street, a.sub_locality, line2, a.country].filter(Boolean).join("\n");
+  }
+
+  // ---- Dates -----------------------------------------------------------
+  function fmt(d, opts) {
+    var loc = hostContext.locale || undefined;
+    try { return new Intl.DateTimeFormat(loc, Object.assign({ timeZone: "UTC" }, opts)).format(d); }
+    catch (e) { return d.toUTCString().slice(0, 16); }
+  }
+  // Contacts dates are calendar days with an optional year, not instants:
+  // format them in UTC so no time zone can shift them by a day.
+  function formatPartialDate(p) {
+    if (!p || !p.month || !p.day) return "";
+    var d = new Date(Date.UTC(p.year || 2000, p.month - 1, p.day));
+    return p.year ? fmt(d, { year: "numeric", month: "long", day: "numeric" })
+                  : fmt(d, { month: "long", day: "numeric" });
+  }
+  function daysUntil(p) {
+    var now = new Date();
+    var today = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+    for (var y = now.getFullYear(); y <= now.getFullYear() + 1; y++) {
+      var m = p.month - 1, day = p.day;
+      if (m === 1 && day === 29 && !(y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0))) { m = 2; day = 1; }
+      var t = Date.UTC(y, m, day);
+      if (t >= today) return Math.round((t - today) / 864e5);
+    }
+    return null;
+  }
+  function birthdayValue(p) {
+    var frag = document.createDocumentFragment();
+    frag.appendChild(document.createTextNode(formatPartialDate(p)));
+    var n = daysUntil(p);
+    if (n !== null && n <= 30) {
+      frag.appendChild(el("span", "dim", n === 0 ? "  · today 🎂" : n === 1 ? "  · tomorrow" : "  · in " + n + " days"));
+    }
+    return frag;
+  }
+
+  // ---- Other cards -----------------------------------------------------
+  function renderOthers(c) {
+    var wrap = $("others");
+    wrap.textContent = "";
+    var list = c.other_cards || [];
+    var linked = list.filter(function (o) { return o.linked; });
+    var separate = list.filter(function (o) { return !o.linked; });
+
+    if (linked.length) {
+      var names = unique(linked.map(function (o) { return o.container_name || "another account"; }));
+      var r = el("div", "other");
+      r.insertAdjacentHTML("beforeend", ICONS.link);
+      var t = el("span", "txt");
+      // With a container of its own this card is one of the linked set;
+      // without one it *is* the set, joined from the cards listed.
+      t.appendChild(document.createTextNode(c.container_name
+        ? "Linked with " + (linked.length === 1 ? "a card" : linked.length + " cards") + " in "
+        : "Linked cards in "));
+      names.forEach(function (n, i) {
+        if (i) t.appendChild(document.createTextNode(i === names.length - 1 ? " and " : ", "));
+        t.appendChild(el("b", "", n));
+      });
+      t.appendChild(document.createTextNode(c.container_name ? " — shown here as one." : ", shown here as one."));
+      r.appendChild(t);
+      wrap.appendChild(r);
+    }
+
+    separate.slice(0, 3).forEach(function (o) {
+      var r = el("div", "other");
+      r.insertAdjacentHTML("beforeend", ICONS.cards);
+      var t = el("span", "txt");
+      var same = o.container_id && o.container_id === c.container_id;
+      t.appendChild(document.createTextNode("Another card with this name "));
+      if (same) t.appendChild(document.createTextNode("in the same account"));
+      else { t.appendChild(document.createTextNode("is in ")); t.appendChild(el("b", "", o.container_name || "another account")); }
+      var diff = diffText(o);
+      if (diff) { t.appendChild(document.createTextNode(" · ")); t.appendChild(el("span", "diff", diff)); }
+      r.appendChild(t);
+      if (o.open_link) {
+        var b = el("button", "btn ghost small", "Open");
+        b.type = "button";
+        b.title = "Open that card in Contacts";
+        b.addEventListener("click", function () { openLink(o.open_link); });
+        r.appendChild(b);
+      }
+      wrap.appendChild(r);
+    });
+    if (separate.length > 3) {
+      wrap.appendChild(el("div", "other", "+ " + (separate.length - 3) + " more cards with this name"));
+    }
+    wrap.hidden = !wrap.childNodes.length;
+  }
+  function diffText(o) {
+    var here = o.only_here || [], there = o.only_there || [];
+    if (!here.length && !there.length) return "same emails and phone numbers";
+    var out = [];
+    if (here.length) out.push("only on this card: " + clip(here));
+    if (there.length) out.push("only on that one: " + clip(there));
+    return out.join("; ");
+  }
+  function clip(list) { return list.slice(0, 2).join(", ") + (list.length > 2 ? " +" + (list.length - 2) : ""); }
+  function unique(a) { return a.filter(function (v, i) { return a.indexOf(v) === i; }); }
+
+  // ---- Fold --------------------------------------------------------------
+  function armCollapse() {
+    var body = $("body"), wrap = $("bodyWrap"), more = $("moreBtn");
+    body.className = "body";
+    wrap.className = "body-wrap";
+    more.hidden = true;
+    pendingCollapse = function () {
+      // Reading scrollHeight forces layout, so this measures synchronously.
+      if (body.scrollHeight > body.clientHeight + 40) {
+        wrap.classList.add("overflows");
+        more.hidden = false;
+        more.onclick = function () {
+          body.classList.add("expanded");
+          wrap.classList.add("expanded-wrap");
+          more.hidden = true;
+          reportSize();
+        };
+      } else {
+        body.classList.add("expanded");
+      }
+    };
+    decideCollapse();
+  }
+
+  // ---- Actions -------------------------------------------------------
+  function openLink(url) {
+    if (!url) return;
+    if (hostCapabilities.openLinks || connected) {
+      request("ui/open-link", { url: url }).catch(function (err) { console.warn("ui/open-link rejected", err); });
+    } else {
+      try { window.open(url, "_blank", "noopener"); } catch (e) { /* sandboxed */ }
+    }
+  }
+
+  $("openBtn").addEventListener("click", function () {
+    if (!contact) return;
+    // open_link is an http://127.0.0.1 URL served by the connector: the
+    // browser hits it and it hands the addressbook:// URL to Contacts.app.
+    // Chat hosts refuse to open addressbook:// directly, so it comes second.
+    openLink(contact.open_link || contact.contact_link);
+  });
+
+  // ---- Shared helpers (initials, colours: same as the Mail card) ------
+  function initials(s) {
+    s = String(s || "").replace(/["'“”]/g, "").trim();
+    if (!s) return "?";
+    if (/^[+\d(]/.test(s)) return "#";
+    if (s.indexOf("@") !== -1 && s.indexOf(" ") === -1) return s[0].toUpperCase();
+    var parts = s.split(/\s+/).filter(Boolean);
+    return ((parts[0] || "")[0] + ((parts.length > 1 ? parts[parts.length - 1] : "")[0] || "")).toUpperCase();
+  }
+  var PALETTE = ["#d95f5f", "#dd8a3b", "#c9a227", "#5aa35a", "#3f9f8f", "#4a8fdc", "#6a6fdc", "#a05fd9", "#d15fa9", "#7f8a99"];
+  function avatarColor(key) {
+    var h = 0; key = String(key || "").toLowerCase();
+    for (var i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+    return PALETTE[h % PALETTE.length];
+  }
+
+  connect();
+})();
+</script>
+</body>
+</html>

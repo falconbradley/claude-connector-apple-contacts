@@ -1,6 +1,6 @@
 # Apple Contacts MCP
 
-A Claude Desktop extension that gives **Claude full access to Apple Contacts** on macOS via Apple's first-class **Contacts framework**. Read, search, create, update, and delete contacts and groups — including photos, vCard import/export, and finding and merging duplicates.
+A Claude Desktop extension that gives **Claude full access to Apple Contacts** on macOS via Apple's first-class **Contacts framework**. Read, search, create, update, and delete contacts and groups — including photos, vCard import/export, finding and merging duplicates, and showing any contact as an inline card in the chat.
 
 Packaged as an [MCPB desktop extension](https://support.claude.com/en/articles/12922929-building-desktop-extensions-with-mcpb) with the Contacts.app icon and one-click install.
 
@@ -21,7 +21,8 @@ Packaged as an [MCPB desktop extension](https://support.claude.com/en/articles/1
 | `list_contacts` | Filter by container, group, kind, text, has-email / has-phone / has-image; sort; paginate |
 | `search_contacts` | Free-text search across names, organisation, emails, URLs, and phone digits |
 | `get_contact` | Full detail — every labeled field, birthday, groups, container, and (on request) notes |
-| `get_contact_link` | `addressbook://` URL that opens the contact in Contacts.app |
+| `preview_contact` | The same contact rendered as an **inline card in the chat** — photo, name, company, phones, emails, addresses, birthday, account, other cards for the same person, and an Open-in-Contacts button (see [Preview card](#preview-card)) |
+| `get_contact_link` | Links that open the contact in Contacts.app: a clickable localhost `open_link` and the raw `addressbook://` URL |
 | `get_me_card` | The user's own "me" card |
 | `get_contact_image` | Contact photo, full or thumbnail, as base64 with MIME type |
 | `export_vcards` | vCard 3.0 text for one or more contacts, optionally with photos |
@@ -56,6 +57,21 @@ Contacts stores labels as constants like `_$!<Home>!$_`. The connector translate
 
 Contact ids are `CNContact.identifier` — the same `<UUID>:ABPerson` string Contacts.app's own scripting dictionary uses — and are stable across launches. Unified contacts (cards linked across accounts) appear once, under the unified id.
 
+### Preview card
+
+When you ask to *see* a contact ("show me Ada's card", "pull up the plumber"), Claude calls `preview_contact` and the result renders as a card right in the transcript, the way the companion [Apple Mail](https://github.com/falconbradley/claude-connector-apple-mail) (`preview_email`, `preview_thread`) and [Apple Messages](https://github.com/falconbradley/claude-connector-apple-messages) connectors show theirs — same look, same light/dark handling. It is an [MCP App](https://modelcontextprotocol.io/specification/draft/extensions/apps): a `ui://apple-contacts/contact-preview` HTML resource the host loads in a sandboxed iframe. Hosts without MCP Apps get the text result instead — `get_contact`'s JSON plus `open_link` and `other_cards`.
+
+The card shows:
+
+- **Photo** — Contacts' own thumbnail (with your crop), shrunk to a small JPEG when it is large. Thumbnails in a real store reach 1 MB, and a full photo is a few hundred KB of base64, so the image rides only to the card, never into Claude's context. No photo, or one the framework cannot read, shows initials.
+- Name, nickname, job title and company; phones, emails (click to call or write), addresses, birthday (with a countdown when it is close) and other dates, websites and profiles, relations, and groups.
+- **The account** the card lives in (iCloud, Google, …) — and **other cards for the same person**: cards linked into this one, and separate cards with the same name in another account, with the emails and phone numbers that differ ("only on this card: ada@work.example"). A same-name card is not necessarily a duplicate, so the card says "another card with this name".
+- **Open in Contacts**, which fronts Contacts.app on the card.
+
+Notes stay opt-in: `preview_contact(include_notes=true)` shows the note, via the same Contacts.app scripting as `get_contact`.
+
+**Why the links are `http://127.0.0.1`.** Chat hosts refuse to open `addressbook://` URLs, so — like the Mail and Notes connectors — this one runs a tiny localhost redirector (port 46327 by default). A link looks like `http://127.0.0.1:46327/open/<contact id>?t=<token>`; clicking it opens a browser tab, the server checks the contact exists, hands `addressbook://<id>` to macOS, and the tab closes itself. It listens on 127.0.0.1 only, requires a per-install token (kept in `~/Library/Application Support/apple-contacts-mcp/weblink.json` so links in old transcripts keep working), and never serves contact data — its only action is bringing Contacts.app forward.
+
 ---
 
 ## Notes
@@ -83,6 +99,7 @@ If the framework ever does hand over notes (for example, a future signed build w
 - **iCloud normalises some fields on sync.** A social profile's label is dropped and IM service names are rewritten (Jabber becomes `JabberInstant`). The create/update response shows what was written; a later read shows what iCloud kept.
 - **Removing contacts from iCloud / CardDAV groups goes through Contacts.app.** On current macOS the framework's `removeMember` reports success and changes nothing for CardDAV groups. The connector detects that and asks Contacts.app to do it, so removal needs the same Automation permission as notes on those accounts. Local (On My Mac) groups are handled by the framework alone. If neither route changes the membership, the tool fails rather than reporting success.
 - `find_duplicate_contacts` returns the largest clusters first, so in a store with many real duplicates a two-contact pair can fall outside the default `limit` of 50. Raise `limit` or scope with `container_id`.
+- **Linked contacts can have no account of their own.** A contact joined from linked cards may carry a unified id that no account owns, so its `container_name` is null. `get_contact_link`, `get_contact`, and the preview card resolve such a contact to one of its linked cards (the card's header lists every account involved). The `contact_link` in list and search results is still the unified id; use `get_contact_link` for a link that opens.
 - Linked-card management (link / unlink unified contacts) and non-Gregorian birthdays have no public API and are not exposed.
 
 ---
@@ -158,7 +175,7 @@ sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db \
 Once installed, ask Claude things like:
 
 - "Find everyone at Impulse Labs and add them to a group called Work."
-- "What's Ada's mobile number?" / "Show me Ada's card."
+- "What's Ada's mobile number?" (answered from `get_contact`) / "Show me Ada's card." (rendered by `preview_contact`)
 - "Add a contact for Dr. Grace Hopper, work email grace@example.com, birthday December 9."
 - "Are there any duplicate contacts?" → then "Merge those two Grace entries, keep the one with the photo."
 - "Export my Family group as a vCard."
@@ -189,6 +206,10 @@ claude-connector-apple-contacts/
         ├── server.py                # MCP tools (MCPServer)
         ├── contacts.py              # Contacts.framework-backed ContactsStore
         ├── notes.py                 # Notes via Contacts.app scripting
+        ├── appscript.py             # Contacts.app scripting (notes, group removal)
+        ├── preview.py               # MCP Apps preview card: resource, payload, photo shrinking
+        ├── ui/contact_preview.html  # The card itself (self-contained, no network)
+        ├── weblink.py               # Localhost redirector behind open_link
         ├── permissions.py           # TCC grant helpers
         └── models.py                # Pydantic data models
 ```
@@ -196,8 +217,10 @@ claude-connector-apple-contacts/
 ### Tests
 
 ```bash
-# Static tests — model shapes, validation, label tables, helpers, and a
-# manifest ↔ server tool-list check. No permissions needed.
+# Static tests — model shapes, validation, label tables, helpers, the
+# preview card (resource, tool metadata, self-contained HTML, photo
+# shrinking, redirector), and a manifest ↔ server tool-list check. No
+# permissions needed.
 uv run python tests/test_e2e.py --skip-live
 
 # Full suite. A plain shell is denied Contacts access on macOS (the request
@@ -231,6 +254,7 @@ Two groups:
 - [x] Duplicate detection and merging
 - [x] Notes via Contacts.app scripting
 - [x] `addressbook://` deep links, "me" card, stats
+- [x] Inline preview card (MCP Apps) with clickable Open-in-Contacts links
 
 **v2 — under consideration**
 - [ ] Link / unlink unified cards (no public API; would need Contacts.app scripting)
@@ -246,6 +270,7 @@ Two groups:
 - Operations are gated by macOS TCC: nothing happens until you grant Contacts access, and notes additionally need Automation permission.
 - macOS-only (`"platforms": ["darwin"]` in manifest).
 - The connector never reaches outside Contacts — no Calendar, Mail, or Messages data.
+- The only network listener is the open-link redirector: bound to 127.0.0.1, token-protected, and it serves no contact data (see [Preview card](#preview-card)). The preview card itself loads nothing from the network; its photo is embedded in the tool result.
 - Destructive operations (`delete_contact`, `delete_group`, `merge_contacts`) are explicit tools the model must choose to call; they never run as side effects of reads.
 
 ---
@@ -266,6 +291,12 @@ That is the intended, readable failure. If you instead see only `Error executing
 
 **A label came back as `_$!<Something>!$_`**
 That is an Apple constant the connector's table does not know. It should still be displayed lowercased without the wrapper; if not, open an issue with the label text.
+
+**The preview card doesn't appear — Claude answers in text instead**
+The card needs a chat client with MCP Apps support (current Claude Desktop and claude.ai). After installing an update that adds a tool, restart Claude Desktop: it caches each connector's tool list per session, so a new tool is invisible until then.
+
+**"Open in Contacts" opens a browser tab that says the contact was not found**
+The card was deleted or merged since the preview was made. Search again and preview the surviving card.
 
 **Extension doesn't appear after install**
 Make sure you're running a recent Claude Desktop that supports MCPB extensions. Restart Claude Desktop after installing.

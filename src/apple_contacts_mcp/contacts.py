@@ -68,6 +68,7 @@ from .models import (
     LabeledDate,
     LabeledValue,
     MergeResult,
+    OtherCard,
     PartialDate,
     PostalAddress,
     SocialProfile,
@@ -286,6 +287,42 @@ def _digits(s: Optional[str]) -> str:
 def _phone_key(s: Optional[str]) -> str:
     d = _digits(s)
     return d[-10:] if len(d) >= 10 else d
+
+
+def _name_key(c: Any) -> str:
+    """Folded name two cards must share to count as "the same name".
+
+    Given + family name for people (organisation name when a person card has
+    neither), organisation name for organisations. Used by duplicate
+    detection and the preview card's other-cards note, so both agree.
+    """
+    if int(c.contactType()) == CN_TYPE_ORGANIZATION:
+        return _fold(c.organizationName())
+    return _fold(f"{_s(c.givenName())} {_s(c.familyName())}") or _fold(c.organizationName())
+
+
+def _contact_value_diff(a: Any, b: Any) -> tuple[list[str], list[str]]:
+    """Emails and phone numbers on `a` but not `b`, and on `b` but not `a`.
+
+    Emails compare case-insensitively and phones by their last ten digits
+    (as duplicate detection does), so the same number formatted differently
+    in two accounts is not reported as a difference. Values come back as
+    written on the card they belong to.
+    """
+    def values(c: Any) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for lv in c.emailAddresses() or []:
+            v = _s(lv.value())
+            if v.strip():
+                out.setdefault("e:" + _fold(v), v)
+        for lv in c.phoneNumbers() or []:
+            v = _s(lv.value().stringValue())
+            if _digits(v):
+                out.setdefault("p:" + _phone_key(v), v)
+        return out
+
+    va, vb = values(a), values(b)
+    return [v for k, v in va.items() if k not in vb], [v for k, v in vb.items() if k not in va]
 
 
 def _make_contact_link(contact_id: str) -> str:
@@ -614,12 +651,17 @@ class ContactsStore:
         keys: list[Any],
         predicate: Any = None,
         sort: str = "default",
+        unify: bool = True,
     ) -> list[Any]:
-        """Enumerate unified contacts matching `predicate` (None = all)."""
+        """Enumerate contacts matching `predicate` (None = all).
+
+        Unified by default, the way Contacts.app lists them; `unify=False`
+        returns the raw per-account cards behind them instead.
+        """
         req = CNContactFetchRequest.alloc().initWithKeysToFetch_(keys)
         if predicate is not None:
             req.setPredicate_(predicate)
-        req.setUnifyResults_(True)
+        req.setUnifyResults_(unify)
         req.setSortOrder_(_SORT_TO_CN.get(sort, 1))
         results: list[Any] = []
 
@@ -991,7 +1033,40 @@ class ContactsStore:
         if cont is not None:
             detail.container_id = str(cont.identifier())
             detail.container_name = _s(cont.name())
+        else:
+            # A unified id no account owns: link to a card Contacts.app knows.
+            detail.contact_link = _make_contact_link(self._openable_id(detail.id))
         return detail
+
+    def _openable_id(self, contact_id: str) -> str:
+        """An id for `contact_id` that Contacts.app's addressbook:// handler knows.
+
+        Contacts.app identifies cards by their per-account `<UUID>:ABPerson`
+        id. A unified contact usually carries one of those, but one joined
+        from linked cards can carry an identifier of its own that no account
+        owns (a bare UUID; 160 of 813 contacts in one real store), and it has
+        no container. For those, link to one of its linked cards instead --
+        preferring the default account's -- since Contacts.app shows linked
+        cards together whichever one is opened. Any other id comes back as is.
+        """
+        if self._container_of_contact(contact_id) is not None:
+            return contact_id
+        try:
+            target = self._fetch_one(contact_id, [CN.CNContactIdentifierKey])
+            raw = [str(c.identifier()) for c in self._fetch(
+                [CN.CNContactIdentifierKey], CNContact.predicateForContactsLinkedToContact_(target), unify=False
+            )]
+        except Exception:
+            logger.warning("Could not resolve linked cards of %s.", contact_id, exc_info=True)
+            return contact_id
+        if not raw:
+            return contact_id
+        default = self._default_container_id()
+        for rid in raw:
+            cont = self._container_of_contact(rid)
+            if cont is not None and str(cont.identifier()) == default:
+                return rid
+        return raw[0]
 
     def get_contact(self, contact_id: str, include_notes: bool = False) -> ContactDetail:
         c = self._fetch_one(contact_id, _DETAIL_KEYS)
@@ -1001,8 +1076,8 @@ class ContactsStore:
         return detail
 
     def get_contact_link(self, contact_id: str) -> str:
-        self._fetch_one(contact_id, [CN.CNContactIdentifierKey])
-        return _make_contact_link(contact_id)
+        self._fetch_one(contact_id, [CN.CNContactIdentifierKey])  # raises ValueError if missing
+        return _make_contact_link(self._openable_id(contact_id))
 
     def get_me_card(self, include_notes: bool = False) -> Optional[ContactDetail]:
         fn = getattr(self._store, "unifiedMeContactWithKeysToFetch_error_", None)
@@ -1046,6 +1121,134 @@ class ContactsStore:
             size=len(data),
             data_base64=base64.b64encode(data).decode("ascii"),
         )
+
+    def get_avatar_image(self, contact_id: str) -> bytes:
+        """The image Contacts.app shows in the card's avatar circle, or b"".
+
+        That is the thumbnail, which carries the user's crop; the full image
+        is read only when a contact has a photo but no thumbnail. Never
+        raises: a photo that is missing or unreadable (see get_contact_image
+        on fresh iCloud photos) just means the preview card shows initials.
+        Size is not bounded here — thumbnails reach 1 MB in real stores —
+        so callers that embed it must shrink it first.
+        """
+        try:
+            c = self._fetch_one(
+                contact_id, [CN.CNContactImageDataAvailableKey, CN.CNContactThumbnailImageDataKey]
+            )
+            if not c.imageDataAvailable():
+                return b""
+            data = _bytes_of(c.thumbnailImageData())
+            if data:
+                return data
+            return _image_bytes(self._fetch_one(
+                contact_id, [CN.CNContactImageDataAvailableKey, CN.CNContactImageDataKey]
+            ))
+        except Exception:
+            logger.warning("Could not read the avatar image of %s.", contact_id, exc_info=True)
+            return b""
+
+    def is_me_card(self, contact_id: str) -> bool:
+        """Whether `contact_id` is (or is unified with) the user's "me" card."""
+        fn = getattr(self._store, "unifiedMeContactWithKeysToFetch_error_", None)
+        if fn is None:
+            return False
+        try:
+            me, _err = fn([CN.CNContactIdentifierKey], None)
+            if me is None:
+                return False
+            return str(me.identifier()) == contact_id or bool(me.isUnifiedWithContactWithIdentifier_(contact_id))
+        except Exception:
+            return False
+
+    def other_cards(self, contact_id: str, limit: int = 5) -> list[OtherCard]:
+        """Other cards that look like the same person as `contact_id`.
+
+        Two kinds, linked first:
+          - cards linked into this unified contact (Contacts.app "Link
+            Contacts"), whose fields already appear on it;
+          - separate unified contacts with the same name (see `_name_key`),
+            typically the same person saved in another account. For those,
+            the emails and phones that differ are listed both ways.
+
+        A same-name card is not proof of the same person, so callers should
+        say "another card with this name", not "a duplicate". Best effort:
+        a failed lookup returns what it found so far rather than raising.
+        """
+        keys = _SUMMARY_KEYS
+        target = self._fetch_one(contact_id, keys)
+        seen = {contact_id}
+        out: list[OtherCard] = []
+        containers = self._container_name_map()
+
+        def card(c: Any, linked: bool) -> OtherCard:
+            cid = str(c.identifier())
+            cont = self._container_of_contact(cid)
+            cont_id = str(cont.identifier()) if cont is not None else None
+            here, there = [], []
+            if not linked:
+                here, there = _contact_value_diff(target, c)
+            return OtherCard(
+                id=cid, display_name=_display_name(c), container_id=cont_id,
+                container_name=containers.get(cont_id) if cont_id else None,
+                linked=linked, only_here=here, only_there=there,
+            )
+
+        try:
+            pred = CNContact.predicateForContactsLinkedToContact_(target)
+            for c in self._fetch(keys, pred, unify=False):
+                cid = str(c.identifier())
+                if cid not in seen:
+                    seen.add(cid)
+                    out.append(card(c, linked=True))
+        except Exception:
+            logger.warning("Linked-card lookup failed for %s.", contact_id, exc_info=True)
+
+        key = _name_key(target)
+        if key:
+            try:
+                for c in self._same_name_candidates(target, keys):
+                    cid = str(c.identifier())
+                    if cid not in seen and _name_key(c) == key:
+                        seen.add(cid)
+                        out.append(card(c, linked=False))
+            except Exception:
+                logger.warning("Same-name lookup failed for %s.", contact_id, exc_info=True)
+
+        return out[:limit]
+
+    _NAME_SCAN_KEYS: list[Any] = [
+        CN.CNContactIdentifierKey, CN.CNContactTypeKey, CN.CNContactGivenNameKey,
+        CN.CNContactFamilyNameKey, CN.CNContactOrganizationNameKey,
+    ]
+
+    def _same_name_candidates(self, target: Any, keys: list[Any]) -> list[Any]:
+        """Unified contacts that may share `target`'s name (a superset).
+
+        Asks the name index for one name part -- given name, else family
+        name, else organisation -- which is a superset of the exact matches
+        whenever the index tokenised that part the ordinary way. It does not
+        always: a surname wrapped in underscores never matches, even the card
+        it came from. Since a working query must return `target` itself, its
+        absence means the index cannot help with this name, and the fallback
+        is a scan over names only, fetching full keys for the matches.
+        """
+        tid = str(target.identifier())
+        if int(target.contactType()) == CN_TYPE_ORGANIZATION:
+            parts = [_s(target.organizationName())]
+        else:
+            parts = [_s(target.givenName()), _s(target.familyName()), _s(target.organizationName())]
+        query = next((p.strip() for p in parts if p.strip()), "")
+        if query:
+            try:
+                found = self._fetch(keys, CNContact.predicateForContactsMatchingName_(query))
+                if any(str(c.identifier()) == tid for c in found):
+                    return found
+            except Exception:
+                logger.debug("Name-index query failed for %r; scanning.", query, exc_info=True)
+        key = _name_key(target)
+        ids = [str(c.identifier()) for c in self._fetch(self._NAME_SCAN_KEYS) if _name_key(c) == key]
+        return self._fetch_by_ids(ids, keys)
 
     def get_stats(self) -> ContactsStats:
         rows = self._fetch(_STATS_KEYS)
@@ -1426,12 +1629,7 @@ class ContactsStore:
         if "name" in by:
             buckets: dict[str, list[Any]] = {}
             for c in rows:
-                if int(c.contactType()) == CN_TYPE_ORGANIZATION:
-                    key = _fold(c.organizationName())
-                else:
-                    key = _fold(f"{_s(c.givenName())} {_s(c.familyName())}")
-                    if not key:
-                        key = _fold(c.organizationName())
+                key = _name_key(c)
                 if key:
                     buckets.setdefault(key, []).append(c)
             for key, members in buckets.items():
